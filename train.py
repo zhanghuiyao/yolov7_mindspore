@@ -24,9 +24,11 @@ from mindspore.context import ParallelMode
 from mindspore.communication.management import init, get_rank, get_group_size
 from mindspore.ops import functional as F
 
+from mindspore import Profiler
+
 from network.yolo import Model
 from network.common import ModelEMA
-from network.loss import ComputeLoss, ComputeLossOTA
+from network.loss import *
 from config.args import get_args
 from utils.optimizer import get_group_param_yolov7, get_lr_yolov7
 from utils.dataset import create_dataloader
@@ -55,7 +57,7 @@ def train(hyp, opt):
 
     # Model
     sync_bn = opt.sync_bn and context.get_context("device_target") == "Ascend" and rank_size > 1
-    model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors'), sync_bn=sync_bn)  # create
+    model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors'), sync_bn=sync_bn, opt=opt)  # create
     if rank % 8 == 0:
         ema_model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors'), sync_bn=sync_bn)
         ema = ModelEMA(ema_model)
@@ -82,7 +84,7 @@ def train(hyp, opt):
             p.requires_grad = False
 
     # Image sizes
-    gs = max(int(model.stride.max()), 32)  # grid size (max stride)
+    gs = max(int(model.stride.asnumpy().max()), 32)  # grid size (max stride)
     nl = model.model[-1].nl  # number of detection layers (used for scaling hyp['obj'])
     imgsz, imgsz_test = [check_img_size(x, gs) for x in opt.img_size]  # verify imgsz are gs-multiples
     train_path = data_dict['train']
@@ -90,7 +92,7 @@ def train(hyp, opt):
     dataloader, dataset, per_epoch_size = create_dataloader(train_path, imgsz, batch_size, gs, opt,
                                                             hyp=hyp, augment=True, cache=opt.cache_images,
                                                             rect=opt.rect, rank_size=opt.rank_size, rank=opt.rank,
-                                                            num_parallel_workers=1,
+                                                            num_parallel_workers=8 if rank_size > 1 else 16,
                                                             image_weights=opt.image_weights, quad=opt.quad,
                                                             prefix=colorstr('train: '))
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
@@ -132,51 +134,27 @@ def train(hyp, opt):
     if ema:
         ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride', 'class_weights'])
 
-    # Def train func
-    if 'loss_ota' not in hyp or hyp['loss_ota'] == 1:
-        compute_loss = ComputeLossOTA(model)  # init loss class
+    # amp
+    ms.amp.auto_mixed_precision(model, amp_level="O2")
+    loss_scaler = DynamicLossScaler(2 ** 10, 2, 1000)
+
+    if opt.ms_strategy == "StaticShape":
+        train_step = create_train_static_shape_fn(opt, model, optimizer, loss_scaler)
+    elif opt.ms_strategy == "MultiShape":
+        raise NotImplementedError
+    elif opt.ms_strategy == "DynamicShape":
+        assert opt.ms_mode == "pynative", f"The dynamic shape function under static graph is under development. Please " \
+                                          f"look forward to the subsequent MS version."
+        train_step = create_train_dynamic_shape_fn(opt, model, optimizer, loss_scaler)
     else:
-        compute_loss = ComputeLoss(model)  # init loss class
-    if opt.is_distributed:
-        mean = context.get_auto_parallel_context("gradients_mean")
-        degree = context.get_auto_parallel_context("device_num")
-        grad_reducer = nn.DistributedGradReducer(optimizer.parameters, mean, degree)
-    else:
-        grad_reducer = ops.functional.identity
-    loss_scaler = DynamicLossScaler(2**10, 2, 1000)
-    # @ms.ms_function
-    def forward_func(x, label, sizes=None, use_ota=False):
-        if sizes is not None:
-            x = ops.interpolate(x, sizes=sizes, coordinate_transformation_mode="asymmetric", mode="bilinear")
-        pred = model(x)
-        if use_ota:
-            loss, loss_items = compute_loss(pred, label, x)
-        else:
-            loss, loss_items = compute_loss(pred, label)
-        return loss_scaler.scale(loss), loss_items
-    grad_fn = ops.value_and_grad(forward_func, grad_position=None, weights=optimizer.parameters, has_aux=True)
-    all_finite_fn = all_finite if context.get_context("device_target") != "CPU" else all_finite_cpu
-    @ms.ms_function
-    def train_step(x, label, sizes=None, use_ota=False, optimizer_update=True):
-        (loss, loss_items), grads = grad_fn(x, label, sizes, use_ota)
-        grads = grad_reducer(grads)
-        grads_finite = all_finite_fn(grads)
-        unscaled_grads = loss_scaler.unscale(grads)
-
-        if grads_finite:
-            if optimizer_update:
-                loss = ops.depend(loss, optimizer(unscaled_grads))
-                _ = loss_scaler.adjust(grads_finite)
-        else:
-            print("overflow, loss scale adjust to ", loss_scaler.scale_value)
-        return loss, loss_items, unscaled_grads, grads_finite, grads_finite
+        raise NotImplementedError
 
 
-    # Start training
     data_loader = dataloader.create_dict_iterator(output_numpy=True, num_epochs=1)
     s_time = time.time()
     accumulate_grads = None
-    accumulate_finite = Tensor(True, ms.bool_)
+    accumulate_cur_step = 0
+
     for i, data in enumerate(data_loader):
         if i < warmup_steps:
             xi = [0, warmup_steps]  # x interp
@@ -188,7 +166,7 @@ def train(hyp, opt):
         cur_epoch = (i // per_epoch_size) + 1
         cur_step = (i % per_epoch_size) + 1
         imgs, labels, paths = data["img"], data["label_out"], data["img_files"]
-        imgs, labels = Tensor(imgs, ms.float32), Tensor(labels, ms.float32)
+        imgs, labels = Tensor(imgs, ms.float16), Tensor(labels, ms.float16)
 
         # Multi-scale
         ns = None
@@ -200,26 +178,41 @@ def train(hyp, opt):
                 # imgs = ops.interpolate(imgs, sizes=ns, coordinate_transformation_mode="asymmetric", mode="bilinear")
 
         # Accumulate Grad
+        s_train_time = time.time()
         if accumulate == 1:
-            _, loss_item, _, _ = train_step(imgs, labels, ns, True, True)
+            _, loss_item, _, grads_finite = train_step(imgs, labels, ns, True)
+            loss_scaler.adjust(grads_finite)
+            if not grads_finite:
+                print("overflow, loss scale adjust to ", loss_scaler.scale_value.asnumpy())
         else:
-            _, loss_item, grads, grads_finite = train_step(imgs, labels, ns, True, False)
-            accumulate_finite = ops.logical_and(accumulate_finite, grads_finite)
-            if accumulate_grads:
-                assert len(accumulate_grads) == len(grads)
-                for gi in range(len(grads)):
-                    accumulate_grads[gi] += grads[gi]
+            _, loss_item, grads, grads_finite = train_step(imgs, labels, ns, False)
+            loss_scaler.adjust(grads_finite)
+            if grads_finite:
+                accumulate_cur_step += 1
+                if accumulate_grads:
+                    assert len(accumulate_grads) == len(grads)
+                    for gi in range(len(grads)):
+                        accumulate_grads[gi] += grads[gi]
+                else:
+                    accumulate_grads = list(grads)
 
+                if accumulate_cur_step % accumulate == 0:
+                    optimizer(tuple(accumulate_grads))
+                    print(f"-Epoch: {cur_epoch}, Step: {cur_step}, optimizer an accumulate step success.")
+                    # reset accumulate
+                    accumulate_grads = None
+                    accumulate_cur_step = 0
             else:
-                accumulate_grads = grads
+                print("overflow, loss scale adjust to ", loss_scaler.scale_value.asnumpy())
+                print(f"-Epoch: {cur_epoch}, Step: {cur_step}, this grad overflow, drop.")
 
-            if i % accumulate == 0:
-                optimizer(accumulate_grads)
-                _ = loss_scaler.adjust(accumulate_finite)
-                accumulate_grads = None
-        print(f"epoch {epochs}/{cur_epoch}, step {per_epoch_size}/{cur_step}, "
+        _p_train_size = ns if ns else imgs.shape[2:]
+        print(f"Epoch {epochs}/{cur_epoch}, Step {per_epoch_size}/{cur_step}, size {_p_train_size}, "
+              f"fp/bp time cost: {(time.time() - s_train_time) * 1000:.2f} ms")
+        print(f"Epoch {epochs}/{cur_epoch}, Step {per_epoch_size}/{cur_step}, size {_p_train_size}, "
               f"lbox: {loss_item[0].asnumpy():.4f}, lobj: {loss_item[1].asnumpy():.4f}, "
               f"lcls: {loss_item[2].asnumpy():.4f}, step time: {(time.time() - s_time) * 1000:.2f} ms")
+        s_time = time.time()
 
         if (rank % 8 == 0) and ((i + 1) % per_epoch_size == 0):
             # Save Checkpoint
@@ -231,7 +224,6 @@ def train(hyp, opt):
                 ms.save_checkpoint(ema.ema_model, ema_ckpt_path, append_dict={"updates": ema.updates})
 
         # TODO: eval every epoch
-
 
 # check code
 def check_train(hyp, opt):
@@ -256,7 +248,7 @@ def check_train(hyp, opt):
         yaml.dump(vars(opt), f, sort_keys=False)
 
     # Model
-    model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors'))  # create
+    model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors'), opt=opt)  # create
     pretrained = weights.endswith('.ckpt')
     if pretrained:
         param_dict = ms.load_checkpoint(weights)
@@ -272,7 +264,7 @@ def check_train(hyp, opt):
             p.requires_grad = False
 
     # Image sizes
-    gs = max(int(model.stride.max()), 32)  # grid size (max stride)
+    gs = max(int(ops.cast(model.stride, ms.float16).max()), 32)  # grid size (max stride)
     nl = model.model[-1].nl  # number of detection layers (used for scaling hyp['obj'])
     imgsz, imgsz_test = [check_img_size(x, gs) for x in opt.img_size]  # verify imgsz are gs-multiples
 
@@ -318,46 +310,130 @@ def check_train(hyp, opt):
     # model.class_weights = Tensor(labels_to_class_weights(dataset.labels, nc) * nc)  # attach class weights
     model.names = names
 
+    # amp
+    ms.amp.auto_mixed_precision(model, amp_level="O2")
+    loss_scaler = DynamicLossScaler(2 ** 10, 2, 1000)
+
+    if opt.ms_strategy == "StaticShape":
+        train_step = create_train_static_shape_fn(opt, model, optimizer, loss_scaler)
+    elif opt.ms_strategy == "MultiShape":
+        raise NotImplementedError
+    elif opt.ms_strategy == "DynamicShape":
+        assert opt.ms_mode == "pynative", f"The dynamic shape function under static graph is under development. Please " \
+                                          f"look forward to the subsequent MS version."
+        train_step = create_train_dynamic_shape_fn(opt, model, optimizer, loss_scaler)
+    else:
+        raise NotImplementedError
+
+    s_time = time.time()
+    for _ in range(50):
+        imgs = Tensor(np.load("imgs.npy"), ms.float16)[:batch_size, ...]
+        labels = Tensor(np.load("labels.npy"), ms.float16)[:batch_size, ...]
+        print("imgs/labels size: ", imgs.shape, labels.shape)
+        _, loss_item, _, grad_finite = train_step(imgs, labels, None, True)
+        loss_scaler.adjust(grad_finite)
+        if not grad_finite:
+            print("overflow, adjust grad to ", loss_scaler.scale_value.asnumpy())
+        print(f"Train one step success, loss: {loss_item}, cost: {(time.time() - s_time) * 1000.:.2f} ms")
+        s_time = time.time()
+    print("Train Finish.")
+
+def create_train_static_shape_fn(opt, model, optimizer, loss_scaler):
     # Def train func
-    if 'loss_ota' not in hyp or hyp['loss_ota'] == 1:
-        compute_loss = ComputeLossOTA(model)  # init loss class
+    use_ota = 'loss_ota' not in hyp or hyp['loss_ota'] == 1
+    if use_ota:
+        compute_loss = ComputeLossOTA_v4(model)  # init loss class
     else:
         compute_loss = ComputeLoss(model)  # init loss class
+    ms.amp.auto_mixed_precision(compute_loss, amp_level="O2")
+
     if opt.is_distributed:
         mean = context.get_auto_parallel_context("gradients_mean")
         degree = context.get_auto_parallel_context("device_num")
         grad_reducer = nn.DistributedGradReducer(optimizer.parameters, mean, degree)
     else:
         grad_reducer = ops.functional.identity
-    loss_scaler = DynamicLossScaler(2**10, 2, 1000)
-    def forward_func(x, label, use_ota=False):
+
+    def forward_func(x, label, sizes=None):
+        if sizes is not None:
+            x = ops.interpolate(x, sizes=sizes, coordinate_transformation_mode="asymmetric", mode="bilinear")
         pred = model(x)
         if use_ota:
             loss, loss_items = compute_loss(pred, label, x)
         else:
             loss, loss_items = compute_loss(pred, label)
         return loss_scaler.scale(loss), loss_items
+
     grad_fn = ops.value_and_grad(forward_func, grad_position=None, weights=optimizer.parameters, has_aux=True)
-    all_finite_fn = all_finite if context.get_context("device_target") != "CPU" else all_finite_cpu
+
     @ms.ms_function
-    def train_step(x, label, use_ota=False):
-        (loss, loss_items), grads = grad_fn(x, label, use_ota)
+    def train_step(x, label, sizes=None, optimizer_update=True):
+        (loss, loss_items), grads = grad_fn(x, label, sizes)
         grads = grad_reducer(grads)
-        grads_finite = all_finite_fn(grads)
+        unscaled_grads = loss_scaler.unscale(grads)
+        grads_finite = all_finite(unscaled_grads)
+        # _ = loss_scaler.adjust(grads_finite)
 
-        if grads_finite:
-            unscaled_grads = loss_scaler.unscale(grads)
-            loss = ops.depend(loss, optimizer(unscaled_grads))
-            _ = loss_scaler.adjust(grads_finite)
+        if optimizer_update:
+            if grads_finite:
+                loss = ops.depend(loss, optimizer(unscaled_grads))
+            else:
+                print("overflow, drop the step.")
+
+        return loss, loss_items, unscaled_grads, grads_finite
+
+    return train_step
+
+
+def create_train_dynamic_shape_fn(opt, model, optimizer, loss_scaler):
+    # # Def train func
+    # if 'loss_ota' not in hyp or hyp['loss_ota'] == 1:
+    #     compute_loss = ComputeLossOTA_v1_dynamic(model)  # init loss class
+    # else:
+    #     compute_loss = ComputeLoss_dynamic(model)  # init loss class
+    use_ota = True
+    compute_loss = ComputeLossOTA_v1_dynamic(model)
+    ms.amp.auto_mixed_precision(compute_loss, amp_level="O2")
+
+    if opt.is_distributed:
+        mean = context.get_auto_parallel_context("gradients_mean")
+        degree = context.get_auto_parallel_context("device_num")
+        grad_reducer = nn.DistributedGradReducer(optimizer.parameters, mean, degree)
+    else:
+        grad_reducer = ops.functional.identity
+
+    def forward_func(x, label, sizes=None):
+        if sizes is not None:
+            x = ops.interpolate(x, sizes=sizes, coordinate_transformation_mode="asymmetric", mode="bilinear")
+        pred = model(x)
+        if use_ota:
+            loss, loss_items = compute_loss(pred, label, x)
         else:
-            print("overflow, loss scale adjust to ", loss_scaler.scale_value)
-        return loss, loss_items
+            loss, loss_items = compute_loss(pred, label)
+        return loss_scaler.scale(loss), loss_items
 
-    imgs = Tensor(np.load("imgs.npy"), ms.float32)[..., :160, :160]
-    labels = Tensor(np.load("labels.npy"), ms.float32)
-    _, loss_item = train_step(imgs, labels, True)
-    print("Train one step success, loss: ", loss_item)
+    grad_fn = ops.value_and_grad(forward_func, grad_position=None, weights=optimizer.parameters, has_aux=True)
 
+    def train_step(x, label, sizes=None, optimizer_update=True):
+        (loss, loss_items), grads = grad_fn(x, label, sizes)
+        grads = grad_reducer(grads)
+        unscaled_grads = loss_scaler.unscale(grads)
+        grads_finite = all_finite(unscaled_grads)
+        # _ = loss_scaler.adjust(grads_finite)
+
+        if optimizer_update:
+            if grads_finite:
+                loss = ops.depend(loss, optimizer(unscaled_grads))
+            else:
+                print("overflow, drop the step.")
+
+        return loss, loss_items, unscaled_grads, grads_finite
+
+    def forward_warpper(x, label, sizes=None, optimizer_update=True):
+        loss, loss_items = forward_func(x, label, sizes)
+        return loss, loss_items, None, Tensor([True], ms.bool_)
+
+    return forward_warpper
 
 
 if __name__ == '__main__':
@@ -369,7 +445,11 @@ if __name__ == '__main__':
     opt.name = 'evolve' if opt.evolve else opt.name
     opt.save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok | opt.evolve)  # increment run
 
-    context.set_context(mode=context.PYNATIVE_MODE, pynative_synchronize=True, device_target=opt.device_target)
+    ms_mode = context.GRAPH_MODE if opt.ms_mode == "graph" else context.PYNATIVE_MODE
+    context.set_context(mode=ms_mode, device_target=opt.device_target)
+    # context.set_context(pynative_synchronize=True)
+    # if opt.device_target == "GPU":
+    #    context.set_context(enable_graph_kernel=True)
     context.reset_auto_parallel_context()
     # Distribute Train
     rank, rank_size, parallel_mode = 0, 1, ParallelMode.STAND_ALONE
@@ -391,7 +471,9 @@ if __name__ == '__main__':
 
     # Train
     if not opt.evolve:
+        # profiler = Profiler()
         # check_train(hyp, opt)
         train(hyp, opt)
+        # profiler.analyse()
     else:
         raise NotImplementedError("Not support evolve train;")

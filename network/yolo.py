@@ -6,7 +6,10 @@ import mindspore as ms
 import mindspore.numpy as mnp
 from mindspore import nn, ops, Tensor
 from mindspore.common.initializer import HeUniform
-from utils.general import make_divisible
+
+import sys
+sys.path.insert(0, "/disk3/zhy/_YOLO/yolo_mindspore")
+
 from utils.autoanchor import check_anchor_order
 from network.common import parse_model, IDetect
 
@@ -46,7 +49,7 @@ def _get_stride_max(stride):
     return int(stride.max())
 
 class Model(nn.Cell):
-    def __init__(self, cfg='yolor-csp-c.yaml', ch=3, nc=None, anchors=None, sync_bn=False):  # model, input channels, number of classes
+    def __init__(self, cfg='yolor-csp-c.yaml', ch=3, nc=None, anchors=None, sync_bn=False, opt=None):  # model, input channels, number of classes
         super(Model, self).__init__()
         self.traced = False
         if isinstance(cfg, dict):
@@ -68,6 +71,14 @@ class Model(nn.Cell):
         self.model, self.save, self.layers_param = parse_model(deepcopy(self.yaml), ch=[ch], sync_bn=sync_bn)
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
         # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
+
+        # Recompute
+        if opt is not None:
+            if opt.recompute and opt.recompute_layers > 0:
+                for i in range(opt.recompute_layers):
+                    self.model[i].recompute()
+                print(f"Turn on recompute, and the results of the first {opt.recompute_layers} layers "
+                      f"will be recomputed.")
 
         # Build strides, anchors
         m = self.model[-1]  # Detect()

@@ -160,34 +160,39 @@ class RepConv(nn.Cell):
         else:
             self.rbr_identity = (BatchNorm(num_features=c1) if c2 == c1 and s == 1 else None)
 
-            self.rbr_dense = nn.SequentialCell([
-                nn.Conv2d(c1, c2, k, s,
-                          pad_mode="pad",
-                          padding=autopad(k, p),
-                          group=g,
-                          has_bias=False,
-                          weight_init=HeUniform(negative_slope=5)),
-                BatchNorm(num_features=c2),
-            ])
-            self.rbr_dense = nn.SequentialCell([
-                nn.Conv2d(c1, c2, k, s,
-                          pad_mode="pad",
-                          padding=autopad(k, p),
-                          group=g,
-                          has_bias=False,
-                          weight_init=HeUniform(negative_slope=5)),
-                BatchNorm(num_features=c2),
-            ])
+            # self.rbr_dense = nn.SequentialCell([
+            #     nn.Conv2d(c1, c2, k, s,
+            #               pad_mode="pad",
+            #               padding=autopad(k, p),
+            #               group=g,
+            #               has_bias=False,
+            #               weight_init=HeUniform(negative_slope=5)),
+            #     BatchNorm(num_features=c2),
+            # ])
+            self.rbr_dense_conv = nn.Conv2d(c1, c2, k, s,
+                                            pad_mode="pad",
+                                            padding=autopad(k, p),
+                                            group=g,
+                                            has_bias=False,
+                                            weight_init=HeUniform(negative_slope=5))
+            self.rbr_dense_norm = BatchNorm(num_features=c2)
 
-            self.rbr_1x1 = nn.SequentialCell(
-                nn.Conv2d(c1, c2, 1, s,
-                          pad_mode="pad",
-                          padding=padding_11,
-                          group=g,
-                          has_bias=False,
-                          weight_init=HeUniform(negative_slope=5)),
-                BatchNorm(num_features=c2),
-            )
+            # self.rbr_1x1 = nn.SequentialCell(
+            #     nn.Conv2d(c1, c2, 1, s,
+            #               pad_mode="pad",
+            #               padding=padding_11,
+            #               group=g,
+            #               has_bias=False,
+            #               weight_init=HeUniform(negative_slope=5)),
+            #     BatchNorm(num_features=c2),
+            # )
+            self.rbr_1x1_conv = nn.Conv2d(c1, c2, 1, s,
+                                          pad_mode="pad",
+                                          padding=padding_11,
+                                          group=g,
+                                          has_bias=False,
+                                          weight_init=HeUniform(negative_slope=5))
+            self.rbr_1x1_norm = BatchNorm(num_features=c2)
 
     def construct(self, inputs):
         if self.deploy:
@@ -198,7 +203,8 @@ class RepConv(nn.Cell):
         else:
             id_out = self.rbr_identity(inputs)
 
-        return self.act(self.rbr_dense(inputs) + self.rbr_1x1(inputs) + id_out)
+        return self.act(self.rbr_dense_norm(self.rbr_dense_conv(inputs)) + \
+                        self.rbr_1x1_norm(self.rbr_1x1_conv(inputs)) + id_out)
 
 
 class ImplicitA(nn.Cell):
@@ -267,10 +273,10 @@ class IDetect(nn.Cell):
                                         weight_init=HeUniform(negative_slope=5),
                                         bias_init=_init_bias((self.no * self.na, x, 1, 1))) for x in ch])  # output conv
 
+
         self.ia = nn.CellList([ImplicitA(x) for x in ch])
         self.im = nn.CellList([ImplicitM(self.no * self.na) for _ in ch])
 
-    @ms.ms_function
     def construct(self, x):
         # x = x.copy()  # for profiling
         # z = ()  # inference output
@@ -281,6 +287,7 @@ class IDetect(nn.Cell):
             out = self.im[i](out)
             bs, _, ny, nx = out.shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
             out = ops.Transpose()(out.view(bs, self.na, self.no, ny, nx), (0, 1, 3, 4, 2))
+            out = out
             outs += (out,)
 
         #     if not self.training:  # inference
@@ -288,8 +295,8 @@ class IDetect(nn.Cell):
         #         x_i_shape = x[i].shape
         #         if grid_i_shape[2] != x_i_shape[2] or grid_i_shape[3] != x_i_shape[3]:
         #         # if self.grid[i].shape[2:4] != x[i].shape[2:4]:
-        #         #     self.grid_cell[i].param = self._make_grid(nx, ny)
-        #             self.grid_cell[i].param = ops.assign(self.grid_cell[i].param, self._make_grid(nx, ny))
+        #         #     self.grid_cell[i].param = self._make_grid(nx, ny, self.grid_cell[i].param.dtype)
+        #             self.grid_cell[i].param = ops.assign(self.grid_cell[i].param, self._make_grid(nx, ny, self.grid_cell[i].param.dtype))
         #
         #         y = ops.Sigmoid()(x[i])
         #         y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid_cell[i].param) * self.stride[i]  # xy
@@ -307,12 +314,13 @@ class IDetect(nn.Cell):
             x[i] = self.m[i](x[i])  # conv
             bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
             x[i] = ops.transpose(x[i].view(bs, self.na, self.no, ny, nx), (0, 1, 3, 4, 2))
+            x[i] = x[i]
 
             if not self.training:  # inference
                 grid_i_shape = self.grid_cell[i].param.shape
                 x_i_shape = x[i].shape
                 if grid_i_shape[2] != x_i_shape[2] or grid_i_shape[3] != x_i_shape[3]:
-                    self.grid_cell[i].param = self._make_grid(nx, ny)
+                    self.grid_cell[i].param = self._make_grid(nx, ny, self.grid_cell[i].param.dtype)
 
                 y = ops.Sigmoid()(x[i])
                 y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid_cell[i].param) * self.stride[i]  # xy
@@ -352,9 +360,9 @@ class IDetect(nn.Cell):
             # self.m[i].weight *= self.im[i].implicit.transpose(0, 1)
 
     @staticmethod
-    def _make_grid(nx=20, ny=20):
+    def _make_grid(nx=20, ny=20, dtype=ms.float32):
         yv, xv = ops.meshgrid([mnp.arange(ny), mnp.arange(nx)])
-        return ops.cast(ops.stack((xv, yv), 2).view((1, 1, ny, nx, 2)), ms.float32)
+        return ops.cast(ops.stack((xv, yv), 2).view((1, 1, ny, nx, 2)), dtype)
 
     def convert(self, z):
         z = ops.concat(z, 1)
