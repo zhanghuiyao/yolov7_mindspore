@@ -5,7 +5,7 @@ import mindspore.numpy as mnp
 from mindspore import nn, ops, Tensor
 
 CLIP_VALUE = 1000.
-EPS = 1e-8
+EPS = 1e-7
 
 @ops.constexpr
 def get_tensor(x, dtype=ms.float32):
@@ -66,7 +66,8 @@ def box_iou(box1, box2):
     inter = ops.minimum(box1[..., 2:], box2[..., 2:]) - ops.maximum(box1[..., :2], box2[..., :2])
     inter = inter.clip(0., None)
     inter = inter[:, :, 0] * inter[:, :, 1]
-    return inter / (area1[:, None] + area2[None, :] - inter)  # iou = inter / (area1 + area2 - inter)
+    # zhy_test
+    return inter / (area1[:, None] + area2[None, :] - inter).clip(EPS, None)  # iou = inter / (area1 + area2 - inter)
 
 def batch_box_iou(batch_box1, batch_box2):
     """
@@ -93,7 +94,8 @@ def batch_box_iou(batch_box1, batch_box2):
             ops.maximum(batch_box1[..., :2], batch_box2[..., :2])
     inter = inter.clip(0., None)
     inter = inter[:, :, :, 0] * inter[:, :, :, 1]
-    return inter / (area1[:, :, None] + area2[:, None, :] - inter)  # iou = inter / (area1 + area2 - inter)
+    # zhy_test
+    return inter / (area1[:, :, None] + area2[:, None, :] - inter).clip(EPS, None)  # iou = inter / (area1 + area2 - inter)
 
 def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
     # Returns Intersection over Union (IoU) of box1(1,4) to box2(n,4)
@@ -200,7 +202,8 @@ class FocalLoss(nn.Cell):
         assert self.loss_fcn.reduction == 'none'  # required to apply FL to each element
 
     def construct(self, pred, true, mask=None):
-        loss = self.loss_fcn(pred, true)
+        ori_dtype = pred.dtype
+        loss = self.loss_fcn(pred.astype(ms.float32), true.astype(ms.float32))
         # p_t = torch.exp(-loss)
         # loss *= self.alpha * (1.000001 - p_t) ** self.gamma  # non-zero power for gradient stability
 
@@ -216,12 +219,12 @@ class FocalLoss(nn.Cell):
 
         if self.reduction == 'mean':
             if mask is not None:
-                return loss.sum() / mask.astype(loss.dtype).sum()
-            return loss.mean()
+                return (loss.sum() / mask.astype(loss.dtype).sum().clip(1, None)).astype(ori_dtype)
+            return loss.mean().astype(ori_dtype)
         elif self.reduction == 'sum':
-            return loss.sum()
+            return loss.sum().astype(ori_dtype)
         else:  # 'none'
-            return loss
+            return loss.astype(ori_dtype)
 
 class BCEWithLogitsLoss(nn.Cell):
     # Wraps focal loss around existing loss_fcn(), i.e. criteria = FocalLoss(nn.BCEWithLogitsLoss(), gamma=1.5)
@@ -232,19 +235,20 @@ class BCEWithLogitsLoss(nn.Cell):
         assert self.loss_fcn.reduction == 'none'  # required to apply FL to each element
 
     def construct(self, pred, true, mask=None):
-        loss = self.loss_fcn(pred, true)
+        ori_dtype = pred.dtype
+        loss = self.loss_fcn(pred.astype(ms.float32), true.astype(ms.float32))
 
         if mask is not None:
             loss *= mask
 
         if self.reduction == 'mean':
             if mask is not None:
-                return loss.sum() / mask.astype(loss.dtype).sum()
-            return loss.mean()
+                return (loss.sum() / mask.astype(loss.dtype).sum().clip(1, None)).astype(ori_dtype)
+            return loss.mean().astype(ori_dtype)
         elif self.reduction == 'sum':
-            return loss.sum()
+            return loss.sum().astype(ori_dtype)
         else:  # 'none'
-            return loss
+            return loss.astype(ori_dtype)
 
 class ComputeLoss(nn.Cell):
     # Compute losses
@@ -290,7 +294,6 @@ class ComputeLoss(nn.Cell):
             # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
         ], dtype=ms.float32)
 
-    # @ms.ms_function
     def construct(self, p, targets):  # predictions, targets
         lcls, lbox, lobj = 0., 0., 0.
 
@@ -302,7 +305,7 @@ class ComputeLoss(nn.Cell):
         # Losses
         for layer_index, pi in enumerate(p):  # layer index, layer predictions
             tmask = tmasks[layer_index]
-            b, a, gj, gi = ops.split(indices[layer_index], 0, 4)  # image, anchor, gridy, gridx
+            b, a, gj, gi = ops.split(indices[layer_index] * tmask[None, :], 0, 4)  # image, anchor, gridy, gridx
             b, a, gj, gi = b.view(-1), a.view(-1), gj.view(-1), gi.view(-1)
             tobj = ops.zeros(pi.shape[:4], pi.dtype) # target obj
 
@@ -316,26 +319,26 @@ class ComputeLoss(nn.Cell):
                 pwh = (ops.Sigmoid()(pwh) * 2) ** 2 * anchors[layer_index]
                 pbox = ops.concat((pxy, pwh), 1)  # predicted box
                 iou = bbox_iou(pbox, tbox[layer_index], CIoU=True).squeeze()  # iou(prediction, target)
-                iou = iou * tmask
-                lbox += (1.0 - iou).mean()  # iou loss
+                # iou = iou * tmask
+                # lbox += (1.0 - iou).mean()  # iou loss
+                lbox += ((1.0 - iou) * tmask).sum() / tmask.astype(iou.dtype).sum()  # iou loss
 
                 # Objectness
                 iou = ops.Identity()(iou).clip(0, None)
                 if self.sort_obj_iou:
                     _, j = ops.sort(iou)
-                    b, a, gj, gi, iou, tmask_sorted = b[j], a[j], gj[j], gi[j], iou[j], tmask[j]
-                else:
-                    tmask_sorted = tmask
+                    b, a, gj, gi, iou, tmask = b[j], a[j], gj[j], gi[j], iou[j], tmask[j]
                 if self.gr < 1:
                     iou = (1.0 - self.gr) + self.gr * iou
-                tobj[b, a, gj, gi] = iou * tmask_sorted  # iou ratio
+                # tobj[b, a, gj, gi] = iou * tmask  # iou ratio
+                tobj[b, a, gj, gi] = ((1.0 - self.gr) + self.gr * ops.identity(iou).clip(0, None)) * tmask  # iou ratio
 
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)
                     t = ops.fill(pcls.dtype, pcls.shape, self.cn) # targets
 
                     t[mnp.arange(n), tcls[layer_index]] = self.cp
-                    lcls += self.BCEcls(pcls, t, tmask[:, None])  # BCE
+                    lcls += self.BCEcls(pcls, t, ops.tile(tmask[:, None], (1, t.shape[-1])))  # BCE
 
             obji = self.BCEobj(pi[..., 4], tobj)
             lobj += obji * self.balance[layer_index]  # obj loss
@@ -350,7 +353,9 @@ class ComputeLoss(nn.Cell):
         lcls *= self.hyp_cls
         bs = p[0].shape[0]  # batch size
 
-        return (lbox + lobj + lcls) * bs, ops.identity(ops.stack((lbox, lobj, lcls)))
+        loss = lbox + lobj + lcls
+
+        return loss * bs, ops.identity(ops.stack((lbox, lobj, lcls, loss)))
 
     def build_targets(self, p, targets):
         # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
@@ -655,7 +660,8 @@ class ComputeLossOTA_v1_dynamic(nn.Cell):
                 matching_matrix[gt_idx][pos_idx] = 1.0
 
             # 2. dynamic-k match with pynative and static-shape
-            # sort_cost, sort_idx = ops.top_k(cost, 10, sorted=True)
+            # sort_cost, sort_idx = ops.top_k(-cost, 10, sorted=True)
+            # sort_cost = -sort_cost
             # pos_idx = ops.stack((mnp.arange(cost.shape[0]), dynamic_ks - 1), -1)
             # pos_v = ops.gather_nd(sort_cost, pos_idx)
             # matching_matrix = ops.cast(cost <= pos_v[:, None], ms.int32)
@@ -1221,7 +1227,7 @@ class ComputeLossOTA_v2(nn.Cell):
             selected_tbox[:, :2] -= grid
             # iou = bbox_iou_2(pbox, selected_tbox, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
             iou = bbox_iou(pbox, selected_tbox, xywh=True, CIoU=True).view(-1)
-            lbox += ((1.0 - iou) * tmask).sum() / tmasks.astype(iou.dtype).sum() # iou loss
+            lbox += ((1.0 - iou) * tmask).sum() / tmask.astype(iou.dtype).sum().clip(1, None) # iou loss
 
             # Objectness
             tobj[b, a, gj, gi] = ((1.0 - self.gr) + self.gr * ops.identity(iou).clip(0, None)) * tmask  # iou ratio
@@ -1278,6 +1284,10 @@ class ComputeLossOTA_v2(nn.Cell):
             _this_anch = anch[i].view(3 * na, batch_size, n_gt_max * 2).transpose(1, 0, 2).view(-1, 2)
             _this_mask = tmasks[i].view(3 * na, batch_size, n_gt_max).transpose(1, 0, 2).view(-1)
 
+            # zhy_test
+            _this_indices *= _this_mask[None, :]
+            _this_anch *= _this_mask[:, None]
+
             b, a, gj, gi = ops.split(_this_indices, 0, 4)
             b, a, gj, gi = b.view(-1), a.view(-1), \
                            gj.view(-1), gi.view(-1)
@@ -1318,11 +1328,11 @@ class ComputeLossOTA_v2(nn.Cell):
         this_mask = all_tmasks[:, None, :] * this_mask[:, :, None] # (bs, gt_max, nl*5*na*gt_max,)
 
         # (bs, gt_max, 4), (bs, nl*5*na*gt_max, 4) -> (bs, gt_max, nl*5*na*gt_max)
-        pair_wise_iou = batch_box_iou(txyxy, pxyxys) * this_mask  # (gt_max, nl*5*na*gt_max,)
-        pair_wise_iou_loss = -ops.log(pair_wise_iou + 1e-8)
+        pair_wise_iou = batch_box_iou(txyxy, pxyxys) * this_mask  # (bs, gt_max, nl*5*na*gt_max,)
+        pair_wise_iou_loss = -ops.log(pair_wise_iou + EPS)
 
-        v, _ = ops.top_k(pair_wise_iou, 10)
-        dynamic_ks = ops.cast(v[:, :, -10:].sum(-1).clip(1, 10), ms.int32) # (bs, gt_max, 10)
+        v, _ = ops.top_k(pair_wise_iou, 10) # (bs, gt_max, 10)
+        dynamic_ks = ops.cast(v.sum(-1).clip(1, 10), ms.int32) # (bs, gt_max)
 
         # (bs, gt_max, 80)
         gt_cls_per_image = ops.one_hot(indices=ops.cast(this_target[:, :, 1], ms.int32),
@@ -1338,7 +1348,7 @@ class ComputeLossOTA_v2(nn.Cell):
         y = cls_preds_
 
         pair_wise_cls_loss = ops.binary_cross_entropy_with_logits(
-            ops.log(y / (1 - y)),
+            ops.log(y / (1 - y) + EPS),
             gt_cls_per_image,
             ops.ones(1, cls_preds_.dtype),
             ops.ones(1, cls_preds_.dtype),
@@ -1346,10 +1356,11 @@ class ComputeLossOTA_v2(nn.Cell):
         ).sum(-1) # (bs, gt_max, nl*5*na*gt_max)
 
         cost = pair_wise_cls_loss + 3.0 * pair_wise_iou_loss
-        cost = cost.clip(-CLIP_VALUE, CLIP_VALUE) * this_mask
+        cost = cost * this_mask
         cost += CLIP_VALUE * (1.0 - ops.cast(this_mask, cost.dtype))
 
-        sort_cost, sort_idx = ops.top_k(cost, 10, sorted=True) # (bs, gt_max, 10)
+        sort_cost, sort_idx = ops.top_k(-cost, 10, sorted=True) # (bs, gt_max, 10)
+        sort_cost = -sort_cost
         pos_idx = ops.stack((mnp.arange(batch_size * n_gt_max), dynamic_ks.view(-1) - 1), -1)
         pos_v = ops.gather_nd(sort_cost.view(batch_size * n_gt_max, 10), pos_idx).view(batch_size, n_gt_max)
         matching_matrix = ops.cast(cost <= pos_v[:, :, None], ms.int32) * this_mask
@@ -1359,26 +1370,28 @@ class ComputeLossOTA_v2(nn.Cell):
         anchor_matching_gt_mask = ops.one_hot(cost_argmin,
                                               n_gt_max,
                                               ops.ones(1, ms.float16),
-                                              ops.zeros(1, ms.float16), axis=-1).transpose(0, 2,
-                                                                                           1)  # (bs, gt_max, nl*5*na*gt_max)
+                                              ops.zeros(1, ms.float16), axis=-1).transpose(0, 2, 1)  # (bs, gt_max, nl*5*na*gt_max)
         matching_matrix = matching_matrix * ops.cast(anchor_matching_gt_mask, matching_matrix.dtype)
 
         fg_mask_inboxes = matching_matrix.astype(ms.float16).sum(1) > 0.0  # (bs, gt_max, nl*5*na*gt_max) -> (bs, nl*5*na*gt_max)
-        all_tmasks = all_tmasks * ops.cast(fg_mask_inboxes, ms.int32)
+        all_tmasks = all_tmasks * ops.cast(fg_mask_inboxes, ms.int32) # (bs, nl*5*na*gt_max)
         matched_gt_inds = matching_matrix.argmax(1) # (bs, gt_max, nl*5*na*gt_max) -> (bs, nl*5*na*gt_max)
         matched_bs_inds = ops.tile(mnp.arange(batch_size)[:, None], (1, matching_matrix.shape[2]))  # (bs, nl*5*na*gt_max)
         matched_inds = ops.stack((matched_bs_inds.view(-1), matched_gt_inds.view(-1)), 1)  # (bs*nl*5*na*gt_max, 2)
+        # zhy_test
+        matched_inds *= all_tmasks.view(-1)[:, None]
         this_target = ops.gather_nd(this_target, matched_inds)  # (bs*nl*5*na*gt_max, 6)
         # this_target = this_target.view(-1, 6)[matched_gt_inds.view(-1,)] # (bs*nl*5*na*gt_max, 6)
 
         # (bs, nl*5*na*gt_max,) -> (bs, nl, 5*na*gt_max) -> (nl, bs*5*na*gt_max)
-        matching_bs = all_b.view(batch_size, nl, -1).transpose(1, 0, 2).view(nl, -1)
-        matching_as = all_a.view(batch_size, nl, -1).transpose(1, 0, 2).view(nl, -1)
-        matching_gjs = all_gj.view(batch_size, nl, -1).transpose(1, 0, 2).view(nl, -1)
-        matching_gis = all_gi.view(batch_size, nl, -1).transpose(1, 0, 2).view(nl, -1)
-        matching_targets = this_target.view(batch_size, nl, -1, 6).transpose(1, 0, 2, 3).view(nl, -1, 6)
-        matching_anchs = all_anch.view(batch_size, nl, -1, 2).transpose(1, 0, 2, 3).view(nl, -1, 2)
+        # zhy_test
         matching_tmasks = all_tmasks.view(batch_size, nl, -1).transpose(1, 0, 2).view(nl, -1)
+        matching_bs = all_b.view(batch_size, nl, -1).transpose(1, 0, 2).view(nl, -1) * matching_tmasks
+        matching_as = all_a.view(batch_size, nl, -1).transpose(1, 0, 2).view(nl, -1) * matching_tmasks
+        matching_gjs = all_gj.view(batch_size, nl, -1).transpose(1, 0, 2).view(nl, -1) * matching_tmasks
+        matching_gis = all_gi.view(batch_size, nl, -1).transpose(1, 0, 2).view(nl, -1) * matching_tmasks
+        matching_targets = this_target.view(batch_size, nl, -1, 6).transpose(1, 0, 2, 3).view(nl, -1, 6) * matching_tmasks[..., None]
+        matching_anchs = all_anch.view(batch_size, nl, -1, 2).transpose(1, 0, 2, 3).view(nl, -1, 2) * matching_tmasks[..., None]
 
         return matching_bs, matching_as, matching_gjs, matching_gis, matching_targets, matching_anchs, matching_tmasks
 
@@ -1413,8 +1426,8 @@ class ComputeLossOTA_v2(nn.Cell):
             # Offsets
             gxy = t[:, 2:4]  # grid xy
             gxi = gain[[2, 3]] - gxy  # inverse
-            jk = ops.logical_and((gxy % 1 < g), (gxy > 1))
-            lm = ops.logical_and((gxi % 1 < g), (gxi > 1))
+            jk = ops.logical_and((gxy % 1. < g), (gxy > 1.))
+            lm = ops.logical_and((gxi % 1. < g), (gxi > 1.))
             j, k = jk[:, 0], jk[:, 1]
             l, m = lm[:, 0], lm[:, 1]
 
@@ -1639,7 +1652,7 @@ class ComputeLossOTA_v3(nn.Cell):
         y = cls_preds_
 
         pair_wise_cls_loss = ops.binary_cross_entropy_with_logits(
-            ops.log(y / (1 - y)),
+            ops.log(y / (1 - y) + EPS),
             gt_cls_per_image,
             ops.ones(1, cls_preds_.dtype),
             ops.ones(1, cls_preds_.dtype),
@@ -1650,7 +1663,8 @@ class ComputeLossOTA_v3(nn.Cell):
         cost = cost.clip(-CLIP_VALUE, CLIP_VALUE) * this_mask
         cost += CLIP_VALUE * (1.0 - ops.cast(this_mask, cost.dtype))
 
-        sort_cost, sort_idx = ops.top_k(cost, 10, sorted=True) # (bs, gt_max, 10)
+        sort_cost, sort_idx = ops.top_k(-cost, 10, sorted=True) # (bs, gt_max, 10)
+        sort_cost = -sort_cost
         pos_idx = ops.stack((mnp.arange(batch_size * n_gt_max), dynamic_ks.view(-1) - 1), -1)
         pos_v = ops.gather_nd(sort_cost.view(batch_size * n_gt_max, 10), pos_idx).view(batch_size, n_gt_max)
         matching_matrix = ops.cast(cost <= pos_v[:, :, None], ms.int32) * this_mask # (bs, gt_max, np)
@@ -1943,7 +1957,7 @@ class ComputeLossOTA_v4(nn.Cell):
 
         # (bs, gt_max, 4), (bs, nl*5*na*gt_max, 4) -> (bs, gt_max, nl*5*na*gt_max)
         pair_wise_iou = batch_box_iou(txyxy, pxyxys) * this_mask  # (gt_max, nl*5*na*gt_max,)
-        pair_wise_iou_loss = -ops.log(pair_wise_iou + 1e-8)
+        pair_wise_iou_loss = -ops.log(pair_wise_iou + EPS)
 
         v, _ = ops.top_k(pair_wise_iou, 10)
         dynamic_ks = ops.cast(v[:, :, -10:].sum(-1).clip(1, 10), ms.int32) # (bs, gt_max, 10)
@@ -1964,8 +1978,8 @@ class ComputeLossOTA_v4(nn.Cell):
         pair_wise_cls_loss = ops.binary_cross_entropy_with_logits(
             ops.log(y / (1 - y) + EPS),
             gt_cls_per_image,
-            ops.ones(1, cls_preds_.dtype),
-            ops.ones(1, cls_preds_.dtype),
+            ops.ones(1, pxyxys.dtype),
+            ops.ones(1, pxyxys.dtype),
             reduction="none",
         ).sum(-1) # (bs, gt_max, nl*5*na*gt_max)
 
@@ -1973,7 +1987,8 @@ class ComputeLossOTA_v4(nn.Cell):
         cost = cost.clip(-CLIP_VALUE, CLIP_VALUE) * this_mask
         cost += (CLIP_VALUE + 1) * (1.0 - ops.cast(this_mask, cost.dtype)) # (bs, gt_max, nl*5*na*gt_max)
 
-        sort_cost, sort_idx = ops.top_k(cost, 10, sorted=True) # (bs, gt_max, 10)
+        sort_cost, sort_idx = ops.top_k(-cost, 10, sorted=True) # (bs, gt_max, 10)
+        sort_cost = -sort_cost
 
         pos_idx = ops.stack((mnp.arange(batch_size * n_gt_max), dynamic_ks.view(-1) - 1), -1)
         pos_v = ops.gather_nd(sort_cost.view(batch_size * n_gt_max, 10), pos_idx).view(batch_size, n_gt_max)

@@ -249,7 +249,8 @@ class LoadImagesAndLabels:  # for training/testing
                 img, labels = load_mosaic(self, index)
             else:
                 img, labels = load_mosaic9(self, index)
-            shapes = None
+            # shapes = None
+            shapes = np.zeros((3, 2))
 
             # MixUp https://arxiv.org/pdf/1710.09412.pdf
             if random.random() < hyp['mixup']:
@@ -268,7 +269,10 @@ class LoadImagesAndLabels:  # for training/testing
             # Letterbox
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
             img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
-            shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+            # shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+            shapes = np.array([[h0, w0],
+                               [h / h0, w / w0],
+                               [pad[0], pad[1]]]) # (3, 2)
 
             labels = self.labels[index].copy()
             if labels.size:  # normalized xywh to pixel xyxy format
@@ -338,18 +342,18 @@ class LoadImagesAndLabels:  # for training/testing
         img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
         img = np.ascontiguousarray(img)
 
-        return img, labels_out, self.img_files[index]
+        return img, labels_out, self.img_files[index], shapes
 
     @staticmethod
-    def collate_fn(img, label, path, batch_info):
+    def collate_fn(img, label, path, shapes, batch_info):
         for i, l in enumerate(label):
             l[:, 0] = i  # add target image index for build_targets()
-        return np.stack(img, 0), np.stack(label, 0), path
+        return np.stack(img, 0), np.stack(label, 0), path, np.stack(shapes, 0)
 
     @staticmethod
-    def collate_fn4(img, label, path, batch_info):
+    def collate_fn4(img, label, path, shapes, batch_info):
         n = len(img) // 4
-        img4, label4, path4 = [], [], path[:n]
+        img4, label4, path4, shapes4 = [], [], path[:n], shapes[:n]
 
         ho = np.array([[0., 0, 0, 1, 0, 0]])
         wo = np.array([[0., 0, 1, 0, 0, 0]])
@@ -374,7 +378,7 @@ class LoadImagesAndLabels:  # for training/testing
         for i, l in enumerate(label4):
             l[:, 0] = i  # add target image index for build_targets()
 
-        return np.stack(img4, 0), np.stack(label4, 0), path4
+        return np.stack(img4, 0), np.stack(label4, 0), path4, shapes4
 
 
 def create_dataloader(path, imgsz, batch_size, stride, opt, epoch_size=300, hyp=None, augment=False,
@@ -395,7 +399,7 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, epoch_size=300, hyp=
 
     cores = multiprocessing.cpu_count()
     num_parallel_workers = min(int(cores / rank_size), num_parallel_workers)
-    dataset_column_names = ["img", "label_out", "img_files"]
+    dataset_column_names = ["img", "label_out", "img_files", "shapes"]
     if rank_size > 1:
         ds = de.GeneratorDataset(dataset, column_names=dataset_column_names,
                                  num_parallel_workers=min(8, num_parallel_workers),

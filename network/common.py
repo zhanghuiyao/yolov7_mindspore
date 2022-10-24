@@ -74,9 +74,9 @@ class Conv(nn.Cell):
                               has_bias=False,
                               weight_init=HeUniform(negative_slope=5))
         if _SYNC_BN:
-            self.bn = nn.SyncBatchNorm(c2)
+            self.bn = nn.SyncBatchNorm(c2, momentum=(1 - 0.03), eps=1e-3)
         else:
-            self.bn = nn.BatchNorm2d(c2)
+            self.bn = nn.BatchNorm2d(c2, momentum=(1 - 0.03), eps=1e-3)
         self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Cell) else nn.Identity())
 
     def construct(self, x):
@@ -158,7 +158,7 @@ class RepConv(nn.Cell):
                                          bias_init=_init_bias(_conv_weight_shape))
 
         else:
-            self.rbr_identity = (BatchNorm(num_features=c1) if c2 == c1 and s == 1 else None)
+            self.rbr_identity = (BatchNorm(num_features=c1, momentum=(1 - 0.03), eps=1e-3) if c2 == c1 and s == 1 else None)
 
             # self.rbr_dense = nn.SequentialCell([
             #     nn.Conv2d(c1, c2, k, s,
@@ -167,7 +167,7 @@ class RepConv(nn.Cell):
             #               group=g,
             #               has_bias=False,
             #               weight_init=HeUniform(negative_slope=5)),
-            #     BatchNorm(num_features=c2),
+            #     BatchNorm(num_features=c2, momentum=(1-0.03), eps=1e-3),
             # ])
             self.rbr_dense_conv = nn.Conv2d(c1, c2, k, s,
                                             pad_mode="pad",
@@ -175,7 +175,7 @@ class RepConv(nn.Cell):
                                             group=g,
                                             has_bias=False,
                                             weight_init=HeUniform(negative_slope=5))
-            self.rbr_dense_norm = BatchNorm(num_features=c2)
+            self.rbr_dense_norm = BatchNorm(num_features=c2, momentum=(1 - 0.03), eps=1e-3)
 
             # self.rbr_1x1 = nn.SequentialCell(
             #     nn.Conv2d(c1, c2, 1, s,
@@ -184,7 +184,7 @@ class RepConv(nn.Cell):
             #               group=g,
             #               has_bias=False,
             #               weight_init=HeUniform(negative_slope=5)),
-            #     BatchNorm(num_features=c2),
+            #     BatchNorm(num_features=c2, momentum=(1 - 0.03), eps=1e-3),
             # )
             self.rbr_1x1_conv = nn.Conv2d(c1, c2, 1, s,
                                           pad_mode="pad",
@@ -192,7 +192,7 @@ class RepConv(nn.Cell):
                                           group=g,
                                           has_bias=False,
                                           weight_init=HeUniform(negative_slope=5))
-            self.rbr_1x1_norm = BatchNorm(num_features=c2)
+            self.rbr_1x1_norm = BatchNorm(num_features=c2, momentum=(1 - 0.03), eps=1e-3)
 
     def construct(self, inputs):
         if self.deploy:

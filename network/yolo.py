@@ -15,13 +15,14 @@ from network.common import parse_model, IDetect
 
 
 def initialize_weights(model):
-    for m in model.cells():
-        t = type(m)
-        if t is nn.Conv2d:
+    for n, m in model.cells_and_names():
+        if isinstance(m, nn.Conv2d):
             pass  # nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-        elif t in (nn.BatchNorm2d, nn.SyncBatchNorm):
-            m.eps = 1e-3
-            m.momentum = 0.03
+        elif isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)):
+            pass
+            # This modification is invalid.
+            # m.eps = 1e-3
+            # m.momentum = 0.03
 
 @ops.constexpr
 def _get_h_w_list(ratio, gs, hw):
@@ -94,7 +95,7 @@ class Model(nn.Cell):
             # print('Strides: %s' % m.stride.tolist())
 
         # Init weights, biases
-        initialize_weights(self)
+        initialize_weights(self.model)
 
     def construct(self, x, augment=False):
         if augment:

@@ -1,10 +1,11 @@
 import argparse
 import ast
 
-def get_args():
+def get_args_train():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--ms_strategy', type=str, default='StaticShape', help='train strategy, StaticShape/MultiShape/DynamicShape')
+    parser.add_argument('--ms_strategy', type=str, default='StaticShape', help='train strategy, StaticCell/StaticShape/MultiShape/DynamicShape')
     parser.add_argument('--ms_mode', type=str, default='graph', help='train mode, graph/pynative')
+    parser.add_argument('--ms_loss_scaler', type=str, default='static', help='train loss scaler, static/dynamic')
     parser.add_argument('--is_distributed', type=ast.literal_eval, default=False, help='Distribute train or not')
     parser.add_argument('--device_target', type=str, default='Ascend', help='device target, Ascend/GPU/CPU')
     parser.add_argument('--recompute', type=ast.literal_eval, default=False, help='Recompute')
@@ -46,6 +47,36 @@ def get_args():
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0],
                         help='Freeze layers: backbone of yolov7=50, first3=0 1 2')
+    parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    opt = parser.parse_args()
+    return opt
+
+
+def get_args_test():
+    parser = argparse.ArgumentParser(prog='test.py')
+    parser.add_argument('--ms_mode', type=str, default='graph', help='train mode, graph/pynative')
+    parser.add_argument('--device_target', type=str, default='Ascend', help='device target, Ascend/GPU/CPU')
+    parser.add_argument('--weights', nargs='+', type=str, default='yolov7_300.ckpt', help='model.pt path(s)')
+    parser.add_argument('--data', type=str, default='./config/data/coco.yaml', help='*.data path')
+    parser.add_argument('--cfg', type=str, default='./config/network_yolov7/yolov7.yaml', help='model.yaml path')
+    parser.add_argument('--hyp', type=str, default='./config/data/hyp.scratch.p5.yaml', help='hyperparameters path')
+    parser.add_argument('--batch-size', type=int, default=32, help='size of each image batch')
+    parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
+    parser.add_argument('--conf-thres', type=float, default=0.001, help='object confidence threshold')
+    parser.add_argument('--iou-thres', type=float, default=0.65, help='IOU threshold for NMS')
+    parser.add_argument('--task', default='val', help='train, val, test, speed or study')
+    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--single-cls', action='store_true', help='treat as single-class dataset')
+    parser.add_argument('--augment', action='store_true', help='augmented inference')
+    parser.add_argument('--verbose', action='store_true', help='report mAP by class')
+    parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')
+    parser.add_argument('--save-hybrid', action='store_true', help='save label+prediction hybrid results to *.txt')
+    parser.add_argument('--save-conf', action='store_true', help='save confidences in --save-txt labels')
+    parser.add_argument('--save-json', action='store_true', help='save a cocoapi-compatible JSON results file')
+    parser.add_argument('--project', default='runs/test', help='save to project/name')
+    parser.add_argument('--name', default='exp', help='save to project/name')
+    parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
+    parser.add_argument('--no-trace', action='store_true', help='don`t trace model')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
     opt = parser.parse_args()
     return opt

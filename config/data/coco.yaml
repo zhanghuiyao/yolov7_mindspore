@@ -3,7 +3,7 @@
 dataset_name: coco
 
 # download command/URL (optional)
-download: bash ./scripts/get_coco.sh
+#download: bash ./scripts/get_coco.sh
 
 # train and val data as 1) directory: path/images/, 2) file: path/images.txt, or 3) list: [path1/images/, path2/images/]
 train: /Users/zhanghuiyao/Desktop/coco/train2017.txt  #./coco/train2017.txt  # 118287 images
