@@ -64,19 +64,27 @@ do
     cp -r ../config ./train_parallel$i
     cp -r ../network ./train_parallel$i
     cp -r ../utils ./train_parallel$i
+    mkdir ./train_parallel$i/scripts
+    cp -r ../scripts/*.sh ./train_parallel$i/scripts/
     cd ./train_parallel$i || exit
     echo "start training for rank $RANK_ID, device $DEVICE_ID"
     env > env.log
     taskset -c $cmdopt python train.py \
-        --ms_strategy="StaticCell" \
+        --ms_strategy="StaticShape" \
+        --ms_amp_level="O0" \
+        --ms_loss_scaler="none" \
+        --ms_optim_loss_scale=1024 \
+        --ms_grad_sens=512 \
+        --overflow_still_update=True \
+        --clip_grad=False \
         --cfg=$CONFIG_PATH \
         --data=$DATA_PATH \
         --hyp=$HYP_PATH \
         --device_target=Ascend \
         --is_distributed=True \
+        --epochs=300 \
         --recompute=True \
         --recompute_layers=5 \
-        --epochs=300 \
-        --batch-size=256  > log.txt 2>&1 &
+        --batch-size=128  > log.txt 2>&1 &
     cd ..
 done

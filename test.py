@@ -1,7 +1,9 @@
+import glob
 import os
 import time
 import json
 import yaml
+import datetime
 import argparse
 import numpy as np
 from pathlib import Path
@@ -16,7 +18,7 @@ from config.args import get_args_test
 from utils.general import xywh2xyxy, coco80_to_coco91_class, check_file, check_img_size, xyxy2xywh, xywh2xyxy, \
     increment_path, colorstr, box_iou
 from utils.dataset import create_dataloader
-from utils.metrics import ConfusionMatrix, non_max_suppression, scale_coords
+from utils.metrics import ConfusionMatrix, non_max_suppression, scale_coords, ap_per_class
 from utils.plots import plot_study_txt, plot_images, output_to_target
 
 def test(data,
@@ -31,13 +33,14 @@ def test(data,
          verbose=False,
          model=None,
          dataloader=None,
+         dataset=None,
          save_dir=Path(''),  # for saving images
          save_txt=False,  # for auto-labelling
          save_hybrid=False,  # for hybrid auto-labelling
          save_conf=False,  # save auto-label confidences
-         plots=True,
+         plots=False,
          compute_loss=None,
-         half_precision=True,
+         half_precision=False,
          trace=False,
          is_coco=False,
          v5_metric=False):
@@ -55,35 +58,43 @@ def test(data,
     training = model is not None
     if not training:  # called by train.py
         # Directories
-        save_dir = Path(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))  # increment run
-        (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
+        save_dir = os.path.join(opt.project, datetime.datetime.now().strftime('%Y-%m-%d_time_%H_%M_%S'))
+        os.makedirs(os.path.join(save_dir, "labels"), exist_ok=False)
 
+        # Load model
         # Hyperparameters
         with open(opt.hyp) as f:
             hyp = yaml.load(f, Loader=yaml.SafeLoader)  # load hyps
-        # Load model
-        # model = attempt_load(weights)
         model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors'), sync_bn=False)  # create
-        ckpt_path = weights[0] if len(weights) > 1 else weights
+        ckpt_path = weights[0]
         param_dict = ms.load_checkpoint(ckpt_path)
         ms.load_param_into_net(model, param_dict)
-        print(f"load ckpt from \"{ckpt_path}\" success")
-
-        gs = max(int(model.stride.max()), 32)  # grid size (max stride)
+        print(f"load ckpt from \"{ckpt_path}\" success.")
+        gs = max(int(ops.cast(model.stride, ms.float16).max()), 32)  # grid size (max stride)
         imgsz = check_img_size(imgsz, s=gs)  # check img_size
 
-    # Half
-    if half_precision:
-        ms.amp.auto_mixed_precision(model, amp_level="O2")
+        # Half
+        if half_precision:
+            ms.amp.auto_mixed_precision(model, amp_level="O2")
+
     model.set_train(False)
 
     # Dataloader
     if not training:
         task = opt.task if opt.task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
         dataloader, dataset, per_epoch_size = create_dataloader(data[task], imgsz, batch_size, gs, opt,
-                                                                pad=0.5, rect=True, num_parallel_workers=16,
+                                                                epoch_size=1, pad=0.5, rect=False,
+                                                                num_parallel_workers=8, shuffle=False,
+                                                                drop_remainder=False,
                                                                 prefix=colorstr(f'{task}: '))
-        dataloader = dataloader.create_tuple_iterator(output_numpy=True, num_epochs=1)
+        assert per_epoch_size == dataloader.get_dataset_size()
+        data_loader = dataloader.create_dict_iterator(output_numpy=True, num_epochs=1)
+        print(f"Test create dataset success, epoch size {per_epoch_size}.")
+    else:
+        assert dataset is not None
+        assert dataloader is not None
+        per_epoch_size = dataloader.get_dataset_size()
+        data_loader = dataloader.create_dict_iterator(output_numpy=True, num_epochs=1)
 
     if v5_metric:
         print("Testing with YOLOv5 AP metric...")
@@ -92,20 +103,24 @@ def test(data,
     confusion_matrix = ConfusionMatrix(nc=nc)
     names = {k: v for k, v in enumerate(model.names if hasattr(model, 'names') else model.module.names)}
     coco91class = coco80_to_coco91_class()
-    s = ('%20s' + '%12s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
     p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
     loss = np.zeros(3)
     jdict, stats, ap, ap_class = [], [], [], []
-    for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
+    s_time = time.time()
+    for batch_i, meta_data in enumerate(data_loader):
+        img, targets, paths, shapes = meta_data["img"], meta_data["label_out"],\
+                                      meta_data["img_files"], meta_data["shapes"]
         dtype = ms.float16 if half_precision else ms.float32
+        img = img.astype(np.float) / 255.0 # 0 - 255 to 0.0 - 1.0
         img_tensor = Tensor(img, dtype)
-        img_tensor /= 255.0  # 0 - 255 to 0.0 - 1.0
         targets_tensor = Tensor(targets, dtype)
+        targets = targets.reshape((-1, 6))
+        targets = targets[targets[:, 1] >= 0]
         nb, _, height, width = img.shape  # batch size, channels, height, width
 
         # Run model
         t = time.time()
-        train_out = model(img, augment=augment)  # inference and training outputs
+        pred_out, train_out = model(img_tensor, augment=augment)  # inference and training outputs
         t0 += time.time() - t
 
         # Compute loss # metric with common loss
@@ -113,13 +128,10 @@ def test(data,
             loss += compute_loss(train_out, targets_tensor)[1][:3].asnumpy()  # box, obj, cls
 
         # Run NMS
-        targets[:, 2:] *= np.array([width, height, width, height], dtype)  # to pixels
+        targets[:, 2:] *= np.array([width, height, width, height], targets.dtype)  # to pixels
         lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
         t = time.time()
-        out = ()
-        for p_tensor in range(train_out):
-            out += p_tensor.asnumpy().reshape(batch_size, -1, 6)
-        out = np.concatenate(out, axis=1)
+        out = pred_out.asnumpy()
         out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
         t1 += time.time() - t
 
@@ -149,7 +161,7 @@ def test(data,
                 for *xyxy, conf, cls in predn.tolist():
                     xywh = (xyxy2xywh(np.array(xyxy).reshape((1, 4))) / gn).reshape(-1).tolist()  # normalized xywh
                     line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
-                    with open(save_dir / 'labels' / (path.stem + '.txt'), 'a') as f:
+                    with open(os.path.join(save_dir, 'labels', (path.stem + '.txt')), 'a') as f:
                         f.write(('%g ' * len(line)).rstrip() % line + '\n')
 
             # Append to pycocotools JSON dictionary
@@ -172,7 +184,7 @@ def test(data,
 
                 # target boxes
                 tbox = xywh2xyxy(labels[:, 1:5])
-                scale_coords(img[si].shape[1:], tbox, shapes[si][0], shapes[si][1])  # native-space labels
+                scale_coords(img[si].shape[1:], tbox, shapes[si][0, :], shapes[si][1:, :])  # native-space labels
                 if plots:
                     confusion_matrix.process_batch(predn, np.concatenate((labels[:, 0:1], tbox), 1))
 
@@ -186,11 +198,13 @@ def test(data,
                     # Search for detections
                     if pi.shape[0]:
                         # Prediction to target ious
-                        ious, i = box_iou(predn[pi, :4], tbox[ti]).max(1)  # best ious, indices
+                        all_ious = box_iou(predn[pi, :4], tbox[ti])
+                        ious = all_ious.max(1)  # best ious, indices
+                        i = all_ious.argmax(1)
 
                         # Append detections
                         detected_set = set()
-                        for j in (ious > iouv[0]).nonzero(as_tuple=False):
+                        for j in (ious > iouv[0]).nonzero()[0]:
                             d = ti[i[j]]  # detected target
                             if d.item() not in detected_set:
                                 detected_set.add(d.item())
@@ -204,10 +218,14 @@ def test(data,
 
         # Plot images
         if plots and batch_i < 3:
-            f = save_dir / f'test_batch{batch_i}_labels.jpg'  # labels
+            f = os.path.join(save_dir, f'test_batch{batch_i}_labels.jpg') # labels
             Thread(target=plot_images, args=(img, targets, paths, f, names), daemon=True).start()
-            f = save_dir / f'test_batch{batch_i}_pred.jpg'  # predictions
+            f = os.path.join(save_dir, f'test_batch{batch_i}_pred.jpg') # predictions
             Thread(target=plot_images, args=(img, output_to_target(out), paths, f, names), daemon=True).start()
+
+        print(f"Test step {batch_i + 1}/{per_epoch_size}, cost time {time.time() - s_time:.2f}s", flush=True)
+
+        s_time = time.time()
 
     # Compute statistics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
@@ -217,7 +235,7 @@ def test(data,
         mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
         nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
     else:
-        nt = torch.zeros(1)
+        nt = np.zeros(1)
 
     # Print results
     pf = '%20s' + '%12i' * 2 + '%12.3g' * 4  # print format
@@ -236,17 +254,13 @@ def test(data,
     # Plots
     if plots:
         confusion_matrix.plot(save_dir=save_dir, names=list(names.values()))
-        if wandb_logger and wandb_logger.wandb:
-            val_batches = [wandb_logger.wandb.Image(str(f), caption=f.name) for f in sorted(save_dir.glob('test*.jpg'))]
-            wandb_logger.log({"Validation": val_batches})
-    if wandb_images:
-        wandb_logger.log({"Bounding Box Debugger/Images": wandb_images})
 
     # Save JSON
     if save_json and len(jdict):
         w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # weights
-        anno_json = './coco/annotations/instances_val2017.json'  # annotations json
-        pred_json = str(save_dir / f"{w}_predictions.json")  # predictions json
+        # anno_json = './coco/annotations/instances_val2017.json'  # annotations json
+        anno_json = os.path.join(data["val"][:-12], "annotations/instances_val2017.json")
+        pred_json = os.path.join(save_dir, f"{w}_predictions.json") # predictions json
         print('\nEvaluating pycocotools mAP... saving %s...' % pred_json)
         with open(pred_json, 'w') as f:
             json.dump(jdict, f)
@@ -259,7 +273,7 @@ def test(data,
             pred = anno.loadRes(pred_json)  # init predictions api
             eval = COCOeval(anno, pred, 'bbox')
             if is_coco:
-                eval.params.imgIds = [int(Path(x).stem) for x in dataloader.dataset.img_files]  # image IDs to evaluate
+                eval.params.imgIds = [int(Path(x).stem) for x in dataset.img_files]  # image IDs to evaluate
             eval.evaluate()
             eval.accumulate()
             eval.summarize()
@@ -268,14 +282,16 @@ def test(data,
             print(f'pycocotools unable to run: {e}')
 
     # Return results
-    model.float()  # for training
     if not training:
-        s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
-        print(f"Results saved to {save_dir}{s}")
+        s = f"\n{len(glob.glob(os.path.join(save_dir, 'labels/*.txt')))} labels saved to " \
+            f"{os.path.join(save_dir, 'labels')}" if save_txt else ''
+        print(f"Results saved to {save_dir}, {s}")
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
-    return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
+
+    model.set_train()
+    return (mp, mr, map50, map, *(loss / per_epoch_size).tolist()), maps, t
 
 
 if __name__ == '__main__':
@@ -284,7 +300,9 @@ if __name__ == '__main__':
     opt.data, opt.cfg, opt.hyp = check_file(opt.data), check_file(opt.cfg), check_file(opt.hyp)  # check files
     print(opt)
 
-    ms.set_context(mode=ms.GRAPH_MODE, device_target=opt.device_target)
+    ms_mode = ms.GRAPH_MODE if opt.ms_mode == "graph" else ms.PYNATIVE_MODE
+    ms.set_context(mode=ms_mode, device_target=opt.device_target)
+    ms.set_context(pynative_synchronize=True)
 
     if opt.task in ('train', 'val', 'test'):  # run normally
         test(opt.data,
@@ -301,13 +319,15 @@ if __name__ == '__main__':
              save_hybrid=opt.save_hybrid,
              save_conf=opt.save_conf,
              trace=not opt.no_trace,
+             plots=False,
+             half_precision=False,
              v5_metric=opt.v5_metric
              )
 
     elif opt.task == 'speed':  # speed benchmarks
         for w in opt.weights:
             test(opt.data, w, opt.batch_size, opt.img_size, 0.25, 0.45,
-                 save_json=False, plots=False, v5_metric=opt.v5_metric)
+                 save_json=False, plots=False, half_precision=False, v5_metric=opt.v5_metric)
 
     elif opt.task == 'study':  # run over a range of settings and save/plot
         # python test.py --task study --data coco.yaml --iou 0.65 --weights yolov7.pt
@@ -318,7 +338,7 @@ if __name__ == '__main__':
             for i in x:  # img-size
                 print(f'\nRunning {f} point {i}...')
                 r, _, t = test(opt.data, w, opt.batch_size, i, opt.conf_thres, opt.iou_thres, opt.save_json,
-                               plots=False, v5_metric=opt.v5_metric)
+                               plots=False, half_precision=False, v5_metric=opt.v5_metric)
                 y.append(r + t)  # results and times
             np.savetxt(f, y, fmt='%10.4g')  # save
         os.system('zip -r study.zip study_*.txt')

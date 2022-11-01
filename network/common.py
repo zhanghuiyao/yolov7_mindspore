@@ -258,9 +258,9 @@ class IDetect(nn.Cell):
         self.no = nc + 5  # number of outputs per anchor
         self.nl = len(anchors)  # number of detection layers
         self.na = len(anchors[0]) // 2  # number of anchors
-        self.grid_cell = nn.CellList([BaseCell(ms.Parameter(Tensor(np.zeros(1), ms.float32),
-                                                            requires_grad=False))
-                                      for _ in range(self.nl)])
+        # self.grid_cell = nn.CellList([BaseCell(ms.Parameter(Tensor(np.zeros(1), ms.float32),
+        #                                                     requires_grad=False))
+        #                               for _ in range(self.nl)])
         # self.grid = [Tensor(np.zeros(1), ms.float32)] * self.nl  # init grid
         self.anchors = ms.Parameter(Tensor(anchors, ms.float32).view(self.nl, -1, 2),
                                     requires_grad=False) # shape(nl,na,2)
@@ -278,33 +278,32 @@ class IDetect(nn.Cell):
         self.im = nn.CellList([ImplicitM(self.no * self.na) for _ in ch])
 
     def construct(self, x):
-        # x = x.copy()  # for profiling
-        # z = ()  # inference output
-
+        z = ()  # inference output
         outs = ()
         for i in range(self.nl):
             out = self.m[i](self.ia[i](x[i]))  # conv
             out = self.im[i](out)
-            bs, _, ny, nx = out.shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
-            out = ops.Transpose()(out.view(bs, self.na, self.no, ny, nx), (0, 1, 3, 4, 2))
+            bs, _, ny, nx = out.shape # (bs,255,20,20)
+            out = ops.Transpose()(out.view(bs, self.na, self.no, ny, nx), (0, 1, 3, 4, 2)) # (bs,3,20,20,85)
             out = out
             outs += (out,)
 
-        #     if not self.training:  # inference
-        #         grid_i_shape = self.grid_cell[i].param.shape
-        #         x_i_shape = x[i].shape
-        #         if grid_i_shape[2] != x_i_shape[2] or grid_i_shape[3] != x_i_shape[3]:
-        #         # if self.grid[i].shape[2:4] != x[i].shape[2:4]:
-        #         #     self.grid_cell[i].param = self._make_grid(nx, ny, self.grid_cell[i].param.dtype)
-        #             self.grid_cell[i].param = ops.assign(self.grid_cell[i].param, self._make_grid(nx, ny, self.grid_cell[i].param.dtype))
-        #
-        #         y = ops.Sigmoid()(x[i])
-        #         y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid_cell[i].param) * self.stride[i]  # xy
-        #         y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
-        #         z += (y.view(bs, -1, self.no),)
+            if not self.training:  # inference
+                # grid_i_shape = self.grid_cell[i].param.shape
+                # out_shape = out.shape
+                # if grid_i_shape[2:4] != out_shape[2:4]:
+                #     self.grid_cell[i].param = self._make_grid(nx, ny, self.grid_cell[i].param.dtype)
 
-        return outs
-        # return outs if self.training else (ops.concat(z, 1), outs)
+                grid_tensor = self._make_grid(nx, ny, out.dtype)
+
+                y = ops.Sigmoid()(out)
+                # y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid_cell[i].param) * self.stride[i]  # xy
+                y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + grid_tensor) * self.stride[i]  # xy
+                y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                z += (y.view(bs, -1, self.no),)
+
+        # return outs
+        return outs if self.training else (ops.concat(z, 1), outs)
 
     def fuseforward(self, x):
         # x = x.copy()  # for profiling
@@ -361,7 +360,7 @@ class IDetect(nn.Cell):
 
     @staticmethod
     def _make_grid(nx=20, ny=20, dtype=ms.float32):
-        yv, xv = ops.meshgrid([mnp.arange(ny), mnp.arange(nx)])
+        xv, yv = ops.meshgrid((mnp.arange(ny), mnp.arange(nx)))
         return ops.cast(ops.stack((xv, yv), 2).view((1, 1, ny, nx, 2)), dtype)
 
     def convert(self, z):

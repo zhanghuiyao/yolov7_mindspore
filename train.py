@@ -114,14 +114,14 @@ def train(hyp, opt):
     group_params = [{'params': pg0, 'lr': lr_pg0},
                     {'params': pg1, 'lr': lr_pg1, 'weight_decay': hyp['weight_decay']},
                     {'params': pg2, 'lr': lr_pg2}]
-    opt_loss_scale = 64.0 if opt.ms_strategy == "StaticCell" else 1.0
-    print(f"optimizer loss scale is {opt_loss_scale}")
+
+    print(f"optimizer loss scale is {opt.ms_optim_loss_scale}")
     if opt.optimizer == "sgd":
         optimizer = nn.SGD(group_params, learning_rate=hyp['lr0'], momentum=hyp['momentum'], nesterov=True,
-                           loss_scale=opt_loss_scale)
+                           loss_scale=opt.ms_optim_loss_scale)
     elif opt.optimizer == "adam":
         optimizer = nn.Adam(group_params, learning_rate=hyp['lr0'], beta1=hyp['momentum'], beta2=0.999,
-                            loss_scale=opt_loss_scale)
+                            loss_scale=opt.ms_optim_loss_scale)
     else:
         raise NotImplementedError
 
@@ -140,11 +140,11 @@ def train(hyp, opt):
 
 
     if opt.ms_strategy == "StaticCell":
-        # train_step = create_train_static_shape_cell(model, optimizer)
-        train_step = create_train_static_shape_cell_clip_grad(model, optimizer)
+        train_step = create_train_static_shape_cell(model, optimizer, amp_level=opt.ms_amp_level)
+        # train_step = create_train_static_shape_cell_clip_grad(model, optimizer, amp_level=opt.ms_amp_level)
     else:
         # amp
-        ms.amp.auto_mixed_precision(model, amp_level="O2")
+        ms.amp.auto_mixed_precision(model, amp_level=opt.ms_amp_level)
         if opt.is_distributed:
             mean = context.get_auto_parallel_context("gradients_mean")
             degree = context.get_auto_parallel_context("device_num")
@@ -157,19 +157,32 @@ def train(hyp, opt):
             loss_scaler = DynamicLossScaler(2 ** 12, 2, 1000)
         elif opt.ms_loss_scaler == "static":
             from mindspore.amp import StaticLossScaler
-            loss_scaler = StaticLossScaler(1024)
+            loss_scaler = StaticLossScaler(opt.ms_loss_scaler_value)
+        elif opt.ms_loss_scaler == "none":
+            loss_scaler = None
         else:
             raise NotImplementedError
 
         if opt.ms_strategy == "StaticShape":
-            # train_step = create_train_static_shape_fn(model, optimizer, loss_scaler, grad_reducer)
-            train_step = create_train_static_shape_fn_clip_grad(model, optimizer, loss_scaler, grad_reducer)
+            train_step = create_train_static_shape_fn_gradoperation(model, optimizer, loss_scaler, grad_reducer,
+                                                                    amp_level=opt.ms_amp_level,
+                                                                    overflow_still_update=opt.overflow_still_update,
+                                                                    sens=opt.ms_grad_sens)
+            # if opt.clip_grad:
+            #     train_step = create_train_static_shape_fn_clip_grad(model, optimizer, loss_scaler, grad_reducer,
+            #                                                         amp_level=opt.ms_amp_level,
+            #                                                         overflow_still_update=opt.overflow_still_update)
+            # else:
+            #     train_step = create_train_static_shape_fn(model, optimizer, loss_scaler, grad_reducer,
+            #                                               amp_level=opt.ms_amp_level,
+            #                                               overflow_still_update=opt.overflow_still_update)
         elif opt.ms_strategy == "MultiShape":
             raise NotImplementedError
         elif opt.ms_strategy == "DynamicShape":
             assert opt.ms_mode == "pynative", f"The dynamic shape function under static graph is under development. Please " \
                                               f"look forward to the subsequent MS version."
-            train_step = create_train_dynamic_shape_fn(model, optimizer, loss_scaler, grad_reducer)
+            train_step = create_train_dynamic_shape_fn(model, optimizer, loss_scaler, grad_reducer,
+                                                       amp_level=opt.ms_amp_level)
         else:
             raise NotImplementedError
 
@@ -193,7 +206,8 @@ def train(hyp, opt):
         cur_epoch = (i // per_epoch_size) + 1
         cur_step = (i % per_epoch_size) + 1
         imgs, labels, paths = data["img"], data["label_out"], data["img_files"]
-        imgs, labels = Tensor(imgs, ms.float16), Tensor(labels, ms.float16)
+        input_dtype = ms.float32 if opt.ms_amp_level == "O0" else ms.float16
+        imgs, labels = Tensor(imgs, input_dtype), Tensor(labels, input_dtype)
 
         # Multi-scale
         ns = None
@@ -219,12 +233,14 @@ def train(hyp, opt):
         else:
             if accumulate == 1:
                 _, loss_item, _, grads_finite = train_step(imgs, labels, ns, True)
-                loss_scaler.adjust(grads_finite)
-                if not grads_finite:
-                    print("overflow, loss scale adjust to ", loss_scaler.scale_value.asnumpy())
+                if loss_scaler:
+                    loss_scaler.adjust(grads_finite)
+                    if not grads_finite:
+                        print("overflow, loss scale adjust to ", loss_scaler.scale_value.asnumpy())
             else:
                 _, loss_item, grads, grads_finite = train_step(imgs, labels, ns, False)
-                loss_scaler.adjust(grads_finite)
+                if loss_scaler:
+                    loss_scaler.adjust(grads_finite)
                 if grads_finite:
                     accumulate_cur_step += 1
                     if accumulate_grads:
@@ -241,8 +257,11 @@ def train(hyp, opt):
                         accumulate_grads = None
                         accumulate_cur_step = 0
                 else:
-                    print(f"Epoch: {cur_epoch}, Step: {cur_step}, this step grad overflow, drop. "
-                          f"Loss scale adjust to {loss_scaler.scale_value.asnumpy()}")
+                    if loss_scaler:
+                        print(f"Epoch: {cur_epoch}, Step: {cur_step}, this step grad overflow, drop. "
+                              f"Loss scale adjust to {loss_scaler.scale_value.asnumpy()}")
+                    else:
+                        print(f"Epoch: {cur_epoch}, Step: {cur_step}, this step grad overflow, drop. ")
 
         _p_train_size = ns if ns else imgs.shape[2:]
         print(f"Epoch {epochs}/{cur_epoch}, Step {per_epoch_size}/{cur_step}, size {_p_train_size}, "
@@ -360,7 +379,7 @@ def check_train(hyp, opt):
         grad_reducer = nn.DistributedGradReducer(optimizer.parameters, mean, degree)
     else:
         grad_reducer = ops.functional.identity
-    ms.amp.auto_mixed_precision(model, amp_level="O2")
+    ms.amp.auto_mixed_precision(model, amp_level=opt.ms_amp_level)
     from mindspore.amp import DynamicLossScaler
     loss_scaler = DynamicLossScaler(2 ** 12, 2, 1000)
 
@@ -376,9 +395,10 @@ def check_train(hyp, opt):
         raise NotImplementedError
 
     s_time = time.time()
+    input_dtype = ms.float32 if opt.ms_amp_level == "O0" else ms.float16
     for i in range(50):
-        imgs = Tensor(np.load("imgs.npy"), ms.float16)[:batch_size, ...]
-        labels = Tensor(np.load("labels.npy"), ms.float16)[:batch_size, ...]
+        imgs = Tensor(np.load("imgs.npy"), input_dtype)[:batch_size, ...]
+        labels = Tensor(np.load("labels.npy"), input_dtype)[:batch_size, ...]
         print("imgs/labels size: ", imgs.shape, labels.shape)
         _, loss_item, _, grad_finite = train_step(imgs, labels, None, True)
         loss_scaler.adjust(grad_finite)
@@ -457,7 +477,7 @@ class TrainOneStepWithClipGradientCell(nn.Cell):
 # ---------------------------------------------------------------------
 
 
-def create_train_static_shape_cell_clip_grad(model, optimizer):
+def create_train_static_shape_cell_clip_grad(model, optimizer, amp_level="O2"):
     # Def train func
     use_ota = 'loss_ota' not in hyp or hyp['loss_ota'] == 1
     if use_ota:
@@ -486,13 +506,13 @@ def create_train_static_shape_cell_clip_grad(model, optimizer):
 
     # 3. TrainOneStepWithClipGradientCell
     train_network = TrainOneStepWithClipGradientCell(net_with_loss, optimizer, sens=1.0)
-    ms.amp.auto_mixed_precision(train_network, amp_level="O2")
+    ms.amp.auto_mixed_precision(train_network, amp_level=amp_level)
 
     train_network.set_train()
 
     return train_network
 
-def create_train_static_shape_cell(model, optimizer):
+def create_train_static_shape_cell(model, optimizer, amp_level="O2"):
     # Def train func
     use_ota = 'loss_ota' not in hyp or hyp['loss_ota'] == 1
     if use_ota:
@@ -520,32 +540,36 @@ def create_train_static_shape_cell(model, optimizer):
     net_with_loss = Warpper(model, compute_loss)
 
     # 1. TrainOneStepWithLossScaleCell
-    ms.amp.auto_mixed_precision(net_with_loss, amp_level="O2")
-    manager = nn.DynamicLossScaleUpdateCell(loss_scale_value=1024.0, scale_factor=2, scale_window=1000)
-    # manager = nn.FixedLossScaleUpdateCell(1024.0)
-    train_network = nn.TrainOneStepWithLossScaleCell(net_with_loss, optimizer, scale_sense=manager)
+    # ms.amp.auto_mixed_precision(net_with_loss, amp_level=amp_level)
+    # manager = nn.DynamicLossScaleUpdateCell(loss_scale_value=1024.0, scale_factor=2, scale_window=1000)
+    # # manager = nn.FixedLossScaleUpdateCell(1024.0)
+    # train_network = nn.TrainOneStepWithLossScaleCell(net_with_loss, optimizer, scale_sense=manager)
 
     # 2. TrainOneStepCell
-    # train_network = nn.TrainOneStepCell(net_with_loss, optimizer, sens=1.0)
-    # ms.amp.auto_mixed_precision(train_network, amp_level="O2")
+    train_network = nn.TrainOneStepCell(net_with_loss, optimizer, sens=1.0)
+    ms.amp.auto_mixed_precision(train_network, amp_level=amp_level)
 
     # 3. TrainOneStepWithClipGradientCell
     # train_network = TrainOneStepWithClipGradientCell(net_with_loss, optimizer, sens=1024)
-    # ms.amp.auto_mixed_precision(train_network, amp_level="O2")
+    # ms.amp.auto_mixed_precision(train_network, amp_level=amp_level)
 
-    train_network = train_network.set_train(True)
+    train_network = train_network.set_train()
 
     return train_network
 
-def create_train_static_shape_fn_clip_grad(model, optimizer, loss_scaler, grad_reducer=None):
+def create_train_static_shape_fn_clip_grad(model, optimizer, loss_scaler, grad_reducer=None, amp_level="O2",
+                                           overflow_still_update=False):
     from mindspore.amp import all_finite
+    if loss_scaler is None:
+        from mindspore.amp import StaticLossScaler
+        loss_scaler = StaticLossScaler(1.0)
     # Def train func
     use_ota = 'loss_ota' not in hyp or hyp['loss_ota'] == 1
     if use_ota:
         compute_loss = ComputeLossOTA_v2(model)  # init loss class
     else:
         compute_loss = ComputeLoss(model)  # init loss class
-    ms.amp.auto_mixed_precision(compute_loss, amp_level="O2")
+    ms.amp.auto_mixed_precision(compute_loss, amp_level=amp_level)
 
     if grad_reducer is None:
         grad_reducer = ops.functional.identity
@@ -576,21 +600,29 @@ def create_train_static_shape_fn_clip_grad(model, optimizer, loss_scaler, grad_r
             if grads_finite:
                 loss = ops.depend(loss, optimizer(unscaled_grads))
             else:
-                print("overflow, drop the step.")
+                if overflow_still_update:
+                    loss = ops.depend(loss, optimizer(unscaled_grads))
+                    print("overflow, still update.")
+                else:
+                    print("overflow, drop the step.")
 
-        return loss, loss_items, unscaled_grads, grads_finite
+        return loss_scaler.unscale(loss), loss_items, unscaled_grads, grads_finite
 
     return train_step
 
-def create_train_static_shape_fn(model, optimizer, loss_scaler, grad_reducer=None):
+def create_train_static_shape_fn(model, optimizer, loss_scaler, grad_reducer=None, amp_level="O2",
+                                 overflow_still_update=False):
     from mindspore.amp import all_finite
+    if loss_scaler is None:
+        from mindspore.amp import StaticLossScaler
+        loss_scaler = StaticLossScaler(1.0)
     # Def train func
     use_ota = 'loss_ota' not in hyp or hyp['loss_ota'] == 1
     if use_ota:
         compute_loss = ComputeLossOTA_v2(model)  # init loss class
     else:
         compute_loss = ComputeLoss(model)  # init loss class
-    ms.amp.auto_mixed_precision(compute_loss, amp_level="O2")
+    ms.amp.auto_mixed_precision(compute_loss, amp_level=amp_level)
 
     if grad_reducer is None:
         grad_reducer = ops.functional.identity
@@ -620,13 +652,70 @@ def create_train_static_shape_fn(model, optimizer, loss_scaler, grad_reducer=Non
             if grads_finite:
                 loss = ops.depend(loss, optimizer(unscaled_grads))
             else:
-                print("overflow, drop the step.")
+                if overflow_still_update:
+                    loss = ops.depend(loss, optimizer(unscaled_grads))
+                    print("overflow, still update.")
+                else:
+                    print("overflow, drop the step.")
 
-        return loss, loss_items, unscaled_grads, grads_finite
+        return loss_scaler.unscale(loss), loss_items, unscaled_grads, grads_finite
 
     return train_step
 
-def create_train_dynamic_shape_fn(model, optimizer, loss_scaler, grad_reducer=None):
+def create_train_static_shape_fn_gradoperation(model, optimizer, loss_scaler, grad_reducer=None, amp_level="O2",
+                                               overflow_still_update=False, sens=1.0):
+    if loss_scaler is not None:
+        print("lossscaler not effective on gradoperation fn.")
+    from mindspore.amp import all_finite
+    # Def train func
+    use_ota = 'loss_ota' not in hyp or hyp['loss_ota'] == 1
+    if use_ota:
+        compute_loss = ComputeLossOTA_v2(model)  # init loss class
+    else:
+        compute_loss = ComputeLoss(model)  # init loss class
+    ms.amp.auto_mixed_precision(compute_loss, amp_level=amp_level)
+
+    if grad_reducer is None:
+        grad_reducer = ops.functional.identity
+
+    def forward_func(x, label, sizes=None):
+        x /= 255.0
+        if sizes is not None:
+            x = ops.interpolate(x, sizes=sizes, coordinate_transformation_mode="asymmetric", mode="bilinear")
+        pred = model(x)
+        if use_ota:
+            loss, loss_items = compute_loss(pred, label, x)
+        else:
+            loss, loss_items = compute_loss(pred, label)
+        return loss, ops.stop_gradient(loss_items)
+
+    grad_fn = ops.GradOperation(get_by_list=True, sens_param=True)(forward_func, optimizer.parameters)
+    sens_value = sens
+
+    @ms.ms_function
+    def train_step(x, label, sizes=None, optimizer_update=True):
+        loss, loss_items = forward_func(x, label, sizes)
+        sens1, sens2 = ops.fill(loss.dtype, loss.shape, sens_value), \
+                       ops.fill(loss_items.dtype, loss_items.shape, sens_value)
+        grads = grad_fn(x, label, sizes, (sens1, sens2))
+        grads = grad_reducer(grads)
+        grads_finite = all_finite(grads)
+
+        if optimizer_update:
+            if grads_finite:
+                loss = ops.depend(loss, optimizer(grads))
+            else:
+                if overflow_still_update:
+                    loss = ops.depend(loss, optimizer(grads))
+                    print("overflow, still update.")
+                else:
+                    print("overflow, drop the step.")
+
+        return loss, loss_items, grads, grads_finite
+
+    return train_step
+
+def create_train_dynamic_shape_fn(model, optimizer, loss_scaler, grad_reducer=None, amp_level="O2"):
     from mindspore.amp import all_finite
     # Def train func
     # use_ota = 'loss_ota' not in hyp or hyp['loss_ota'] == 1
@@ -636,7 +725,7 @@ def create_train_dynamic_shape_fn(model, optimizer, loss_scaler, grad_reducer=No
     else:
         raise NotImplementedError
 
-    ms.amp.auto_mixed_precision(compute_loss, amp_level="O2")
+    ms.amp.auto_mixed_precision(compute_loss, amp_level=amp_level)
 
     if grad_reducer is None:
         grad_reducer = ops.functional.identity

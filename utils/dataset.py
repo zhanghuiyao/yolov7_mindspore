@@ -381,8 +381,9 @@ class LoadImagesAndLabels:  # for training/testing
         return np.stack(img4, 0), np.stack(label4, 0), path4, shapes4
 
 
-def create_dataloader(path, imgsz, batch_size, stride, opt, epoch_size=300, hyp=None, augment=False,
-                      cache=False, pad=0.0, rect=False, rank=0, rank_size=1, num_parallel_workers=8,
+def create_dataloader(path, imgsz, batch_size, stride, opt, epoch_size=300, hyp=None,
+                      augment=False, cache=False, pad=0.0, rect=False, rank=0, rank_size=1,
+                      num_parallel_workers=8, shuffle=True, drop_remainder=True,
                       image_weights=False, quad=False, max_box_per_img=160, prefix=''):
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     dataset = LoadImagesAndLabels(path, imgsz, batch_size,
@@ -402,18 +403,19 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, epoch_size=300, hyp=
     dataset_column_names = ["img", "label_out", "img_files", "shapes"]
     if rank_size > 1:
         ds = de.GeneratorDataset(dataset, column_names=dataset_column_names,
-                                 num_parallel_workers=min(8, num_parallel_workers),
+                                 num_parallel_workers=min(8, num_parallel_workers), shuffle=shuffle,
                                  num_shards=rank_size, shard_id=rank)
     else:
         ds = de.GeneratorDataset(dataset, column_names=dataset_column_names,
-                                 num_parallel_workers=min(32, num_parallel_workers))
+                                 num_parallel_workers=min(32, num_parallel_workers), shuffle=shuffle)
     ds = ds.batch(batch_size,
                   per_batch_map=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn,
                   input_columns=dataset_column_names,
-                  drop_remainder=True)
+                  drop_remainder=drop_remainder)
     ds = ds.repeat(epoch_size)
 
-    per_epoch_size = int(len(dataset) / batch_size / rank_size)
+    per_epoch_size = int(len(dataset) / batch_size / rank_size) if drop_remainder else \
+        math.ceil(len(dataset) / batch_size / rank_size)
 
     return ds, dataset, per_epoch_size
 

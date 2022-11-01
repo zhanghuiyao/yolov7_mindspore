@@ -11,6 +11,6 @@ def check(x1_path, x2_path):
 
 
 if __name__ == '__main__':
-    x1_path = "/data2/zhy/_YOLO/yolo_mindspore/x.npy"
-    x2_path = "/data2/zhy/_YOLO/yolov7_torch_check/x.npy"
+    x1_path = "/data1/zhy/_YOLO/yolo_mindspore/x.npy"
+    x2_path = "/data1/zhy/_YOLO/yolov7_torch_check/x.npy"
     check(x1_path, x2_path)
