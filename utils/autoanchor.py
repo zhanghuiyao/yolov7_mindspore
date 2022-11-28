@@ -1,11 +1,6 @@
 # Auto-anchor utils
 
-import numpy as np
-import yaml
-from scipy.cluster.vq import kmeans
-from tqdm import tqdm
-
-from mindspore import nn, ops, Tensor
+from mindspore import ops
 
 def check_anchor_order(m):
     # Check anchor order against stride order for YOLO Detect() module m, and correct if necessary

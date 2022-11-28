@@ -70,22 +70,19 @@ do
     echo "start training for rank $RANK_ID, device $DEVICE_ID"
     env > env.log
     taskset -c $cmdopt python train.py \
-        --ms_strategy="StaticShape" \
+        --ms_strategy="StaticCell" \
         --ms_amp_level="O0" \
-        --ms_loss_scaler="static" \
-        --ms_loss_scaler_value=1024 \
-        --ms_optim_loss_scale=1 \
-        --ms_grad_sens=1024 \
-        --overflow_still_update=True \
+        --ms_loss_scaler="none" \
+        --optimizer="thor" \
+        --ms_optim_loss_scale=128 \
         --clip_grad=False \
         --sync_bn=True \
-        --optimizer="momentum" \
         --cfg=$CONFIG_PATH \
         --data=$DATA_PATH \
         --hyp=$HYP_PATH \
         --device_target=Ascend \
         --is_distributed=True \
-        --epochs=300 \
+        --epochs=150 \
         --recompute=True \
         --recompute_layers=5 \
         --batch_size=128  > log.txt 2>&1 &

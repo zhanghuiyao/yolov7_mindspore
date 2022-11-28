@@ -49,11 +49,11 @@ mpirun --allow-run-as-root -n ${DEVICE_NUM} --output-filename log_output --merge
 python train.py \
   --ms_strategy="StaticShape" \
   --ms_amp_level="O0" \
-  --ms_loss_scaler="none" \
-  --ms_loss_scaler_value=1.0 \
-  --ms_optim_loss_scale=1.0 \
-  --ms_grad_sens=1.0 \
-  --overflow_still_update=True \
+  --ms_loss_scaler="static" \
+  --ms_loss_scaler_value=1024 \
+  --ms_optim_loss_scale=1024 \
+  --ms_grad_sens=1024 \
+  --overflow_still_update=False \
   --clip_grad=False \
   --cfg=$CONFIG_PATH \
   --data=$DATA_PATH \
@@ -61,5 +61,5 @@ python train.py \
   --device_target=GPU \
   --is_distributed=True \
   --epochs=300 \
-  --batch-size=192 > log.txt 2>&1 &
+  --batch_size=128 > log.txt 2>&1 &
 cd ..

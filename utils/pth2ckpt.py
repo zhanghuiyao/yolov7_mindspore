@@ -118,7 +118,7 @@ def mindspore2pytorch(weight):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(prog='test.py')
+    parser = argparse.ArgumentParser(prog='pth2ckpt.py')
     parser.add_argument('--convert_mode', type=str, default='torch2ms', help='train mode, torch2ms/ms2torch')
     parser.add_argument('--weight', type=str, default='./yolov7_official.pt', help='source checkpoint file')
     parser.add_argument('--is_model', type=ast.literal_eval, default=False, help='Distribute train or not')

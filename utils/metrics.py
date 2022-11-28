@@ -81,8 +81,9 @@ class ConfusionMatrix:
         for i in range(self.nc + 1):
             print(' '.join(map(str, self.matrix[i])))
 
-def _nms(xyxys, scores, threshold):
+def _nms(xyxys, scores, threshold, time_limit=-1, sample_idx=0):
     """Calculate NMS"""
+    s_time = time.time()
     x1 = xyxys[:, 0]
     y1 = xyxys[:, 1]
     x2 = xyxys[:, 2]
@@ -111,10 +112,13 @@ def _nms(xyxys, scores, threshold):
         ovr = intersect_area / (areas[i] + areas[order[1:]] - intersect_area + 1e-6)
         indexes = np.where(ovr <= threshold)[0]
         order = order[indexes + 1]
+        if time_limit > 0 and (time.time() - s_time) > time_limit:
+            print(f"WARNING: NMS time limit {time_limit}s exceeded, Sample {sample_idx}.")
+            break
     return np.array(reserved_boxes)
 
 def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False, multi_label=False,
-                        labels=()):
+                        labels=(), time_limit=20.0):
     """Runs Non-Maximum Suppression (NMS) on inference results
 
     Returns:
@@ -128,7 +132,7 @@ def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=Non
     min_wh, max_wh = 2, 4096  # (pixels) minimum and maximum box width and height
     max_det = 300  # maximum number of detections per image
     max_nms = 30000  # maximum number of boxes into torchvision.ops.nms()
-    time_limit = 10.0  # seconds to quit after
+    time_limit = time_limit  # seconds to quit after
     redundant = True  # require redundant detections
     multi_label &= nc > 1  # multiple labels per box (adds 0.5ms/img)
     merge = False  # use merge-NMS
@@ -185,9 +189,8 @@ def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=Non
         # Batched NMS
         c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
         boxes, scores = x[:, :4] + c, x[:, 4]  # boxes (offset by class), scores
-        # import torchvision
-        # i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
-        i = _nms(boxes, scores, iou_thres) # NMS for per sample
+        _time_limit = -1 # (time_limit - (time.time() - t)) / (prediction.shape[0] - xi)
+        i = _nms(boxes, scores, iou_thres, _time_limit, xi) # NMS for per sample
         if i.shape[0] > max_det:  # limit detections
             i = i[:max_det]
         if merge and (1 < n < 3E3):  # Merge NMS (boxes merged using weighted mean)
@@ -201,7 +204,8 @@ def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=Non
 
         output[xi] = x[i]
         if (time.time() - t) > time_limit:
-            print(f'WARNING: NMS time limit {time_limit}s exceeded')
+            print(f'WARNING: Batch NMS time limit {time_limit}s exceeded, this batch '
+                  f'process {xi + 1}/{prediction.shape[0]} sample.')
             break  # time limit exceeded
 
     return output

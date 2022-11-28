@@ -66,7 +66,7 @@ def test(data,
         with open(opt.hyp) as f:
             hyp = yaml.load(f, Loader=yaml.SafeLoader)  # load hyps
         model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors'), sync_bn=False)  # create
-        ckpt_path = weights[0]
+        ckpt_path = weights
         param_dict = ms.load_checkpoint(ckpt_path)
         ms.load_param_into_net(model, param_dict)
         print(f"load ckpt from \"{ckpt_path}\" success.")
@@ -140,7 +140,7 @@ def test(data,
             labels = targets[targets[:, 0] == si, 1:]
             nl = len(labels)
             tcls = labels[:, 0].tolist() if nl else []  # target class
-            path = Path(paths[si])
+            path = Path(str(paths[si]))
             seen += 1
 
             if len(pred) == 0:
@@ -257,7 +257,7 @@ def test(data,
 
     # Save JSON
     if save_json and len(jdict):
-        w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # weights
+        w = Path(weights).stem if weights is not None else ''  # weights
         # anno_json = './coco/annotations/instances_val2017.json'  # annotations json
         anno_json = os.path.join(data["val"][:-12], "annotations/instances_val2017.json")
         pred_json = os.path.join(save_dir, f"{w}_predictions.json") # predictions json
@@ -325,21 +325,19 @@ if __name__ == '__main__':
              )
 
     elif opt.task == 'speed':  # speed benchmarks
-        for w in opt.weights:
-            test(opt.data, w, opt.batch_size, opt.img_size, 0.25, 0.45,
-                 save_json=False, plots=False, half_precision=False, v5_metric=opt.v5_metric)
+        test(opt.data, opt.weights, opt.batch_size, opt.img_size, 0.25, 0.45,
+             save_json=False, plots=False, half_precision=False, v5_metric=opt.v5_metric)
 
     elif opt.task == 'study':  # run over a range of settings and save/plot
-        # python test.py --task study --data coco.yaml --iou 0.65 --weights yolov7.pt
+        # python test.py --task study --data coco.yaml --iou 0.65 --weights yolov7.ckpt
         x = list(range(256, 1536 + 128, 128))  # x axis (image sizes)
-        for w in opt.weights:
-            f = f'study_{Path(opt.data).stem}_{Path(w).stem}.txt'  # filename to save to
-            y = []  # y axis
-            for i in x:  # img-size
-                print(f'\nRunning {f} point {i}...')
-                r, _, t = test(opt.data, w, opt.batch_size, i, opt.conf_thres, opt.iou_thres, opt.save_json,
-                               plots=False, half_precision=False, v5_metric=opt.v5_metric)
-                y.append(r + t)  # results and times
-            np.savetxt(f, y, fmt='%10.4g')  # save
+        f = f'study_{Path(opt.data).stem}_{Path(opt.weights).stem}.txt'  # filename to save to
+        y = []  # y axis
+        for i in x:  # img-size
+            print(f'\nRunning {f} point {i}...')
+            r, _, t = test(opt.data, opt.weights, opt.batch_size, i, opt.conf_thres, opt.iou_thres, opt.save_json,
+                           plots=False, half_precision=False, v5_metric=opt.v5_metric)
+            y.append(r + t)  # results and times
+        np.savetxt(f, y, fmt='%10.4g')  # save
         os.system('zip -r study.zip study_*.txt')
         plot_study_txt(x=x)  # plot

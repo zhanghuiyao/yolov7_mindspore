@@ -4,9 +4,25 @@ import mindspore as ms
 import mindspore.numpy as mnp
 from mindspore import nn, ops, Tensor
 from mindspore.common.initializer import HeUniform
-from utils.general import make_divisible
+
+def make_divisible(x, divisor):
+    # Returns x evenly divisible by divisor
+    return math.ceil(x / divisor) * divisor
 
 _SYNC_BN = False
+
+class Identity(nn.Cell):
+    def construct(self, x):
+        return x
+
+class Upsample_with_Concat(nn.Cell):
+    def __init__(self, dimension=1):
+        super(Upsample_with_Concat, self).__init__()
+        self.d = dimension
+    def construct(self, x):
+        x1, x2 = x
+        x2 = ops.ResizeNearestNeighbor((x2.shape[-2] * 2, x2.shape[-1] * 2))(x2)
+        return ops.concat((x1, x2), self.d)
 
 class ResizeNearestNeighbor(nn.Cell):
     def __init__(self, scale=2):
@@ -72,14 +88,35 @@ class Conv(nn.Cell):
                               padding=autopad(k, p),
                               group=g,
                               has_bias=False,
-                              weight_init=HeUniform(negative_slope=5))
+                              weight_init=HeUniform(negative_slope=math.sqrt(5)))
+        # # zhy_test
+        # self.conv = nn.Conv2d(c1, c2, k, 1,
+        #                       pad_mode="valid", #"pad",
+        #                       padding=0, #autopad(k, p),
+        #                       group=g,
+        #                       has_bias=False,
+        #                       weight_init=HeUniform(negative_slope=5))
+        # self.s = s
+        # self.out_channel = c2
+        # pad = autopad(k, p)
+        # assert isinstance(pad, int)
+        # self.padding = ((0, 0), (0, 0), (pad, pad), (pad, pad))
+
         if _SYNC_BN:
             self.bn = nn.SyncBatchNorm(c2, momentum=(1 - 0.03), eps=1e-3)
         else:
             self.bn = nn.BatchNorm2d(c2, momentum=(1 - 0.03), eps=1e-3)
-        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Cell) else nn.Identity())
+        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Cell) else Identity())
 
     def construct(self, x):
+        # if self.s == 2:
+        #     return self.act(self.bn(
+        #         ops.Conv2D(self.out_channel, 1, stride=2, group=self.out_channel)(
+        #             self.conv(ops.pad(x, self.padding)), ops.ones((self.out_channel, 1, 1, 1), ms.float32)
+        #         )
+        #     ))
+        # return self.act(self.bn(self.conv(ops.pad(x, self.padding))))
+
         return self.act(self.bn(self.conv(x)))
 
     def fuseforward(self, x):
@@ -117,10 +154,8 @@ class SPPCSPC(nn.Cell):
         for i in range(len(self.m)):
             m_tuple += (self.m[i](x1),)
         y1 = self.cv6(self.cv5(ops.Concat(axis=1)(m_tuple)))
-        # y1 = self.cv6(self.cv5(torch.cat([x1] + [m(x1) for m in self.m], 1)))
         y2 = self.cv2(x)
         return self.cv7(ops.Concat(axis=1)((y1, y2)))
-        # return self.cv7(torch.cat((y1, y2), dim=1))
 
 
 class RepConv(nn.Cell):
@@ -140,7 +175,7 @@ class RepConv(nn.Cell):
 
         padding_11 = autopad(k, p) - k // 2
 
-        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Cell) else nn.Identity())
+        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Cell) else Identity())
 
         if _SYNC_BN:
             BatchNorm = nn.SyncBatchNorm
@@ -148,17 +183,16 @@ class RepConv(nn.Cell):
             BatchNorm = nn.BatchNorm2d
 
         if deploy:
-            _conv_weight_shape = (c2, c1 // g, k, k)
             self.rbr_reparam = nn.Conv2d(c1, c2, k, s,
                                          pad_mode="pad",
                                          padding=autopad(k, p),
                                          group=g,
                                          has_bias=True,
-                                         weight_init=HeUniform(negative_slope=5),
-                                         bias_init=_init_bias(_conv_weight_shape))
+                                         weight_init=HeUniform(negative_slope=math.sqrt(5)),
+                                         bias_init=_init_bias((c2, c1 // g, k, k)))
 
         else:
-            self.rbr_identity = (BatchNorm(num_features=c1, momentum=(1 - 0.03), eps=1e-3) if c2 == c1 and s == 1 else None)
+            self.rbr_identity = BatchNorm(num_features=c1, momentum=(1 - 0.03), eps=1e-3) if c2 == c1 and s == 1 else None
 
             # self.rbr_dense = nn.SequentialCell([
             #     nn.Conv2d(c1, c2, k, s,
@@ -166,7 +200,7 @@ class RepConv(nn.Cell):
             #               padding=autopad(k, p),
             #               group=g,
             #               has_bias=False,
-            #               weight_init=HeUniform(negative_slope=5)),
+            #               weight_init=HeUniform(negative_slope=math.sqrt(5))),
             #     BatchNorm(num_features=c2, momentum=(1-0.03), eps=1e-3),
             # ])
             self.rbr_dense_conv = nn.Conv2d(c1, c2, k, s,
@@ -174,7 +208,7 @@ class RepConv(nn.Cell):
                                             padding=autopad(k, p),
                                             group=g,
                                             has_bias=False,
-                                            weight_init=HeUniform(negative_slope=5))
+                                            weight_init=HeUniform(negative_slope=math.sqrt(5)))
             self.rbr_dense_norm = BatchNorm(num_features=c2, momentum=(1 - 0.03), eps=1e-3)
 
             # self.rbr_1x1 = nn.SequentialCell(
@@ -183,7 +217,7 @@ class RepConv(nn.Cell):
             #               padding=padding_11,
             #               group=g,
             #               has_bias=False,
-            #               weight_init=HeUniform(negative_slope=5)),
+            #               weight_init=HeUniform(negative_slope=math.sqrt(5))),
             #     BatchNorm(num_features=c2, momentum=(1 - 0.03), eps=1e-3),
             # )
             self.rbr_1x1_conv = nn.Conv2d(c1, c2, 1, s,
@@ -191,7 +225,7 @@ class RepConv(nn.Cell):
                                           padding=padding_11,
                                           group=g,
                                           has_bias=False,
-                                          weight_init=HeUniform(negative_slope=5))
+                                          weight_init=HeUniform(negative_slope=math.sqrt(5)))
             self.rbr_1x1_norm = BatchNorm(num_features=c2, momentum=(1 - 0.03), eps=1e-3)
 
     def construct(self, inputs):
@@ -199,12 +233,13 @@ class RepConv(nn.Cell):
             return self.act(self.rbr_reparam(inputs))
 
         if self.rbr_identity is None:
-            id_out = 0
+            id_out = 0.0
         else:
             id_out = self.rbr_identity(inputs)
 
         return self.act(self.rbr_dense_norm(self.rbr_dense_conv(inputs)) + \
-                        self.rbr_1x1_norm(self.rbr_1x1_conv(inputs)) + id_out)
+                        self.rbr_1x1_norm(self.rbr_1x1_conv(inputs)) + \
+                        id_out)
 
 
 class ImplicitA(nn.Cell):
@@ -229,10 +264,6 @@ class ImplicitM(nn.Cell):
     def construct(self, x):
         return self.implicit * x
 
-class BaseCell(nn.Cell):
-    def __init__(self, parameter):
-        super(BaseCell, self).__init__()
-        self.param = parameter
 
 @ops.constexpr(reuse_result=True)
 def get_convert_matrix():
@@ -258,10 +289,6 @@ class IDetect(nn.Cell):
         self.no = nc + 5  # number of outputs per anchor
         self.nl = len(anchors)  # number of detection layers
         self.na = len(anchors[0]) // 2  # number of anchors
-        # self.grid_cell = nn.CellList([BaseCell(ms.Parameter(Tensor(np.zeros(1), ms.float32),
-        #                                                     requires_grad=False))
-        #                               for _ in range(self.nl)])
-        # self.grid = [Tensor(np.zeros(1), ms.float32)] * self.nl  # init grid
         self.anchors = ms.Parameter(Tensor(anchors, ms.float32).view(self.nl, -1, 2),
                                     requires_grad=False) # shape(nl,na,2)
         self.anchor_grid = ms.Parameter(Tensor(anchors, ms.float32).view(self.nl, 1, -1, 1, 1, 2),
@@ -270,7 +297,7 @@ class IDetect(nn.Cell):
         self.m = nn.CellList([nn.Conv2d(x, self.no * self.na, 1,
                                         pad_mode="valid",
                                         has_bias=True,
-                                        weight_init=HeUniform(negative_slope=5),
+                                        weight_init=HeUniform(negative_slope=math.sqrt(5)),
                                         bias_init=_init_bias((self.no * self.na, x, 1, 1))) for x in ch])  # output conv
 
 
@@ -285,7 +312,6 @@ class IDetect(nn.Cell):
             out = self.im[i](out)
             bs, _, ny, nx = out.shape # (bs,255,20,20)
             out = ops.Transpose()(out.view(bs, self.na, self.no, ny, nx), (0, 1, 3, 4, 2)) # (bs,3,20,20,85)
-            out = out
             outs += (out,)
 
             if not self.training:  # inference
@@ -382,6 +408,8 @@ class LayerParam:
 
 def parse_model(d, ch, sync_bn=False):  # model_dict, input_channels(3)
     _SYNC_BN = sync_bn
+    if _SYNC_BN:
+        print('Parse model with Sync BN.')
     print('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
     anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
@@ -398,20 +426,20 @@ def parse_model(d, ch, sync_bn=False):  # model_dict, input_channels(3)
                 pass
 
         n = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        if m in [nn.Conv2d, Conv, RepConv, SPPCSPC]:
+        if m in (nn.Conv2d, Conv, RepConv, SPPCSPC):
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
-                c2 = make_divisible(c2 * gw, 8)
+                c2 = math.ceil(c2 * gw / 8) * 8
 
             args = [c1, c2, *args[1:]]
-            if m in [SPPCSPC,]:
+            if m in (SPPCSPC,):
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m in (nn.BatchNorm2d, nn.SyncBatchNorm):
             args = [ch[f]]
-        elif m is Concat:
+        elif m in (Concat, Upsample_with_Concat):
             c2 = sum([ch[x] for x in f])
-        elif m in [IDetect,]:
+        elif m in (IDetect,):
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)
@@ -433,7 +461,7 @@ def parse_model(d, ch, sync_bn=False):  # model_dict, input_channels(3)
     return nn.CellList(layers), sorted(save), layers_param
 
 
-class ModelEMA:
+class EMA(nn.Cell):
     """ Model Exponential Moving Average from https://github.com/rwightman/pytorch-image-models
     Keep a moving average of everything in the model state_dict (parameters and buffers).
     This is intended to allow functionality like
@@ -444,32 +472,43 @@ class ModelEMA:
     """
 
     def __init__(self, model, decay=0.9999, updates=0):
+        super(EMA, self).__init__()
         # Create EMA
-        model.set_train(False)
-        self.ema_model = model
-        self.updates = updates  # number of EMA updates
-        self.decay = lambda x: decay * (1 - math.exp(-x / 2000))  # decay exponential ramp (to help early epochs)
+        self.weights = ms.ParameterTuple(model.trainable_params())
+        self.ema_weights = self.weights.clone("ema", init='same')
+        self.updates = ms.Parameter(Tensor(updates, ms.float32), requires_grad=False)  # number of EMA updates
+        self.decay_value = decay
+        self.assign = ops.Assign()
+        # self.decay = lambda x: decay * (1 - math.exp(-x / 2000))  # decay exponential ramp (to help early epochs)
 
-    def update(self, model):
+    def decay(self, x):
+        return self.decay_value * (1 - ops.exp(ops.neg(x) / 2000))
+
+    @ms.ms_function
+    def update(self):
         # Update EMA parameters
         self.updates += 1
-        d = self.decay(self.updates)
+        # d = self.decay(self.updates)
+        d = self.decay_value * (1 - ops.Exp()(-self.updates / 2000))
 
-        train_parameters = model.parameters_dict()
-        for k, v in self.ema_model.parameters_dict():
-            v_np = v.asnumpy()
-            v_np *= d
-            v_np += (1. - d) * train_parameters[k].asnumpy()
-            v.set_data(Tensor(v_np, v.dtype))
+        for ema_v, weight in zip(self.ema_weights, self.weights):
+            tep_v = ema_v * d
+            self.assign(ema_v, weight * (1. - d) + tep_v)
 
-    def copy_attr(self, a, b, include=(), exclude=()):
-        # Copy attributes from b to a, options to only include [...] and to exclude [...]
-        for k, v in b.__dict__.items():
-            if (len(include) and k not in include) or k.startswith('_') or k in exclude:
-                continue
-            else:
-                setattr(a, k, v)
+        return self.updates
 
-    def update_attr(self, model, include=(), exclude=('process_group', 'reducer')):
-        # Update EMA attributes
-        self.copy_attr(self.ema_model, model, include, exclude)
+    def clone_from_model(self):
+        for ema_v, weight in zip(self.ema_weights, self.weights):
+            self.assign(ema_v, weight)
+
+    # def copy_attr(self, a, b, include=(), exclude=()):
+    #     # Copy attributes from b to a, options to only include [...] and to exclude [...]
+    #     for k, v in b.__dict__.items():
+    #         if (len(include) and k not in include) or k.startswith('_') or k in exclude:
+    #             continue
+    #         else:
+    #             setattr(a, k, v)
+    #
+    # def update_attr(self, model, include=(), exclude=('process_group', 'reducer')):
+    #     # Update EMA attributes
+    #     self.copy_attr(self.ema_model, model, include, exclude)

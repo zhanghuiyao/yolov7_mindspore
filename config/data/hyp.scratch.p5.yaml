@@ -33,3 +33,10 @@ copy_paste: 0.0  # image copy paste (probability)
 paste_in: 0.15  # image copy paste (probability), use 0 for faster training
 loss_ota: 1 # use ComputeLossOTA, use 0 for faster training
 max_box_per_img: 160 # label mask
+
+# hyp for thor
+lr_decay: 4.0839
+damping_init: 0.03
+damping_decay: 0.50036
+lr_end_epoch: 176 # epoch size=150
+frequency: 834

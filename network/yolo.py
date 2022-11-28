@@ -2,13 +2,18 @@ import math
 import numpy as np
 from pathlib import Path
 from copy import deepcopy
+
 import mindspore as ms
 import mindspore.numpy as mnp
 from mindspore import nn, ops, Tensor
 from mindspore.common.initializer import HeUniform
 
-import sys
-sys.path.insert(0, "/disk3/zhy/_YOLO/yolo_mindspore")
+import os, sys
+# sys.path.insert(0, "/disk3/zhy/_YOLO/yolo_mindspore")
+dir_path = os.path.dirname(os.path.realpath(__file__))
+parent_dir_path = os.path.abspath(os.path.join(dir_path, os.pardir))
+sys.path.insert(0, parent_dir_path)
+
 
 from utils.autoanchor import check_anchor_order
 from network.common import parse_model, IDetect

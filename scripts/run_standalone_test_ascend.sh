@@ -9,7 +9,8 @@ exit 1
 fi
 
 WEIGHTS=$1
-export CUDA_VISIBLE_DEVICES=$2
+export DEVICE_ID=$2
+export RANK_ID=$2
 
 get_real_path(){
   if [ "${1:0:1}" == "/" ]; then
@@ -37,7 +38,9 @@ echo $CONFIG_PATH
 echo $DATA_PATH
 echo $HYP_PATH
 
+
 export DEVICE_NUM=1
+export RANK_SIZE=1
 rm -rf ./test_standalone$2
 mkdir ./test_standalone$2
 cp ../*.py ./test_standalone$2
@@ -53,8 +56,7 @@ python test.py \
   --cfg=$CONFIG_PATH \
   --data=$DATA_PATH \
   --hyp=$HYP_PATH \
-  --device_target=GPU \
-  --task="val" \
+  --device_target=Ascend \
   --img_size=640 \
   --conf=0.001 \
   --iou=0.65 \
