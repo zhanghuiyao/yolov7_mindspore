@@ -12,24 +12,20 @@ obj: 0.7  # obj loss gain (scale with pixels)
 obj_pw: 1.0  # obj BCELoss positive_weight
 iou_t: 0.20  # IoU training threshold
 anchor_t: 4.0  # anchor-multiple threshold
-# anchors: 3  # anchors per output layer (0 to ignore)
 fl_gamma: 0.0  # focal loss gamma (efficientDet default gamma=1.5)
 hsv_h: 0.015  # image HSV-Hue augmentation (fraction)
 hsv_s: 0.7  # image HSV-Saturation augmentation (fraction)
 hsv_v: 0.4  # image HSV-Value augmentation (fraction)
 degrees: 0.0  # image rotation (+/- deg)
 translate: 0.2  # image translation (+/- fraction)
-# diff1, default is 0.5
 scale: 0.9  # image scale (+/- gain)
 shear: 0.0  # image shear (+/- deg)
 perspective: 0.0  # image perspective (+/- fraction), range 0-0.001
 flipud: 0.0  # image flip up-down (probability)
 fliplr: 0.5  # image flip left-right (probability)
 mosaic: 1.0  # image mosaic (probability)
-# diff2, default is 0.0
 mixup: 0.15  # image mixup (probability)
 copy_paste: 0.0  # image copy paste (probability)
-# diff3, default is 0.0
 paste_in: 0.15  # image copy paste (probability), use 0 for faster training
 loss_ota: 1 # use ComputeLossOTA, use 0 for faster training
 max_box_per_img: 160 # label mask

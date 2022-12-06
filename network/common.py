@@ -89,18 +89,6 @@ class Conv(nn.Cell):
                               group=g,
                               has_bias=False,
                               weight_init=HeUniform(negative_slope=math.sqrt(5)))
-        # # zhy_test
-        # self.conv = nn.Conv2d(c1, c2, k, 1,
-        #                       pad_mode="valid", #"pad",
-        #                       padding=0, #autopad(k, p),
-        #                       group=g,
-        #                       has_bias=False,
-        #                       weight_init=HeUniform(negative_slope=5))
-        # self.s = s
-        # self.out_channel = c2
-        # pad = autopad(k, p)
-        # assert isinstance(pad, int)
-        # self.padding = ((0, 0), (0, 0), (pad, pad), (pad, pad))
 
         if _SYNC_BN:
             self.bn = nn.SyncBatchNorm(c2, momentum=(1 - 0.03), eps=1e-3)
@@ -109,14 +97,6 @@ class Conv(nn.Cell):
         self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Cell) else Identity())
 
     def construct(self, x):
-        # if self.s == 2:
-        #     return self.act(self.bn(
-        #         ops.Conv2D(self.out_channel, 1, stride=2, group=self.out_channel)(
-        #             self.conv(ops.pad(x, self.padding)), ops.ones((self.out_channel, 1, 1, 1), ms.float32)
-        #         )
-        #     ))
-        # return self.act(self.bn(self.conv(ops.pad(x, self.padding))))
-
         return self.act(self.bn(self.conv(x)))
 
     def fuseforward(self, x):
@@ -194,15 +174,6 @@ class RepConv(nn.Cell):
         else:
             self.rbr_identity = BatchNorm(num_features=c1, momentum=(1 - 0.03), eps=1e-3) if c2 == c1 and s == 1 else None
 
-            # self.rbr_dense = nn.SequentialCell([
-            #     nn.Conv2d(c1, c2, k, s,
-            #               pad_mode="pad",
-            #               padding=autopad(k, p),
-            #               group=g,
-            #               has_bias=False,
-            #               weight_init=HeUniform(negative_slope=math.sqrt(5))),
-            #     BatchNorm(num_features=c2, momentum=(1-0.03), eps=1e-3),
-            # ])
             self.rbr_dense_conv = nn.Conv2d(c1, c2, k, s,
                                             pad_mode="pad",
                                             padding=autopad(k, p),
@@ -211,15 +182,6 @@ class RepConv(nn.Cell):
                                             weight_init=HeUniform(negative_slope=math.sqrt(5)))
             self.rbr_dense_norm = BatchNorm(num_features=c2, momentum=(1 - 0.03), eps=1e-3)
 
-            # self.rbr_1x1 = nn.SequentialCell(
-            #     nn.Conv2d(c1, c2, 1, s,
-            #               pad_mode="pad",
-            #               padding=padding_11,
-            #               group=g,
-            #               has_bias=False,
-            #               weight_init=HeUniform(negative_slope=math.sqrt(5))),
-            #     BatchNorm(num_features=c2, momentum=(1 - 0.03), eps=1e-3),
-            # )
             self.rbr_1x1_conv = nn.Conv2d(c1, c2, 1, s,
                                           pad_mode="pad",
                                           padding=padding_11,
@@ -271,12 +233,6 @@ def get_convert_matrix():
                   dtype=ms.float32)
 
 class IDetect(nn.Cell):
-    # stride = None  # strides computed during build
-    # export = False  # onnx export
-    # end2end = False
-    # include_nms = False
-    # concat = False
-
     def __init__(self, nc=80, anchors=(), ch=()):  # detection layer
         super(IDetect, self).__init__()
         self.stride = None
@@ -315,24 +271,18 @@ class IDetect(nn.Cell):
             outs += (out,)
 
             if not self.training:  # inference
-                # grid_i_shape = self.grid_cell[i].param.shape
-                # out_shape = out.shape
-                # if grid_i_shape[2:4] != out_shape[2:4]:
-                #     self.grid_cell[i].param = self._make_grid(nx, ny, self.grid_cell[i].param.dtype)
-
-                grid_tensor = self._make_grid(nx, ny, out.dtype)
+                xv, yv = ops.meshgrid((mnp.arange(ny), mnp.arange(nx)))
+                grid_tensor = ops.cast(ops.stack((xv, yv), 2).view((1, 1, ny, nx, 2)), out.dtype)
+                # grid_tensor = self._make_grid(nx, ny, out.dtype)
 
                 y = ops.Sigmoid()(out)
-                # y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid_cell[i].param) * self.stride[i]  # xy
                 y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + grid_tensor) * self.stride[i]  # xy
                 y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
                 z += (y.view(bs, -1, self.no),)
 
-        # return outs
         return outs if self.training else (ops.concat(z, 1), outs)
 
     def fuseforward(self, x):
-        # x = x.copy()  # for profiling
         z = ()  # inference output
         self.training |= self.export
         for i in range(self.nl):
@@ -342,13 +292,9 @@ class IDetect(nn.Cell):
             x[i] = x[i]
 
             if not self.training:  # inference
-                grid_i_shape = self.grid_cell[i].param.shape
-                x_i_shape = x[i].shape
-                if grid_i_shape[2] != x_i_shape[2] or grid_i_shape[3] != x_i_shape[3]:
-                    self.grid_cell[i].param = self._make_grid(nx, ny, self.grid_cell[i].param.dtype)
-
+                grid_tensor = self._make_grid(nx, ny, x.dtype)
                 y = ops.Sigmoid()(x[i])
-                y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid_cell[i].param) * self.stride[i]  # xy
+                y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + grid_tensor) * self.stride[i]  # xy
                 y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
                 z += (y.view(bs, -1, self.no),)
 
@@ -381,8 +327,6 @@ class IDetect(nn.Cell):
             c1, c2, _, _ = self.im[i].implicit.shape
             self.m[i].bias = ops.assign(self.m[i].bias, self.m[i].bias * self.im[i].implicit.reshape(c2))
             self.m[i].weight = ops.assign(self.m[i].weight, self.m[i].weight * self.im[i].implicit.transpose(0, 1))
-            # self.m[i].bias *= self.im[i].implicit.reshape(c2)
-            # self.m[i].weight *= self.im[i].implicit.transpose(0, 1)
 
     @staticmethod
     def _make_grid(nx=20, ny=20, dtype=ms.float32):
@@ -467,48 +411,39 @@ class EMA(nn.Cell):
     This is intended to allow functionality like
     https://www.tensorflow.org/api_docs/python/tf/train/ExponentialMovingAverage
     A smoothed version of the weights is necessary for some training schemes to perform well.
-    This class is sensitive where it is initialized in the sequence of model init,
-    GPU assignment and distributed training wrappers.
     """
 
     def __init__(self, model, decay=0.9999, updates=0):
         super(EMA, self).__init__()
         # Create EMA
-        self.weights = ms.ParameterTuple(model.trainable_params())
+        self.weights = ms.ParameterTuple(list(model.get_parameters()))
         self.ema_weights = self.weights.clone("ema", init='same')
         self.updates = ms.Parameter(Tensor(updates, ms.float32), requires_grad=False)  # number of EMA updates
         self.decay_value = decay
         self.assign = ops.Assign()
-        # self.decay = lambda x: decay * (1 - math.exp(-x / 2000))  # decay exponential ramp (to help early epochs)
+        self.hyper_map = ops.HyperMap()
 
     def decay(self, x):
+        # decay exponential ramp (to help early epochs)
         return self.decay_value * (1 - ops.exp(ops.neg(x) / 2000))
 
     @ms.ms_function
     def update(self):
         # Update EMA parameters
-        self.updates += 1
-        # d = self.decay(self.updates)
-        d = self.decay_value * (1 - ops.Exp()(-self.updates / 2000))
-
-        for ema_v, weight in zip(self.ema_weights, self.weights):
+        def update_param(d, ema_v, weight):
             tep_v = ema_v * d
-            self.assign(ema_v, weight * (1. - d) + tep_v)
+            return self.assign(ema_v, weight * (1. - d) + tep_v)
 
-        return self.updates
+        updates = ops.assign_add(self.updates, 1)
+        d = self.decay(self.updates)
+        success = self.hyper_map(ops.partial(update_param, d), self.ema_weights, self.weights)
+        updates = ops.depend(updates, success)
 
+        return updates
+
+    @ms.ms_function
     def clone_from_model(self):
-        for ema_v, weight in zip(self.ema_weights, self.weights):
-            self.assign(ema_v, weight)
-
-    # def copy_attr(self, a, b, include=(), exclude=()):
-    #     # Copy attributes from b to a, options to only include [...] and to exclude [...]
-    #     for k, v in b.__dict__.items():
-    #         if (len(include) and k not in include) or k.startswith('_') or k in exclude:
-    #             continue
-    #         else:
-    #             setattr(a, k, v)
-    #
-    # def update_attr(self, model, include=(), exclude=('process_group', 'reducer')):
-    #     # Update EMA attributes
-    #     self.copy_attr(self.ema_model, model, include, exclude)
+        updates = ops.assign_add(self.updates, 1)
+        success = self.hyper_map(ops.assign, self.ema_weights, self.weights)
+        updates = ops.depend(updates, success)
+        return updates

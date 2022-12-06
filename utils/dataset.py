@@ -3,9 +3,6 @@ import logging
 import math
 import os
 import random
-import shutil
-import time
-import cv2
 import hashlib
 import multiprocessing
 import numpy as np
@@ -14,7 +11,6 @@ from PIL import Image, ExifTags
 from tqdm import tqdm
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
-from threading import Thread
 
 import mindspore.dataset as de
 from mindspore.dataset import vision
@@ -75,7 +71,6 @@ class LoadImagesAndLabels:  # for training/testing
         self.stride = stride
         self.path = path
         self.max_box_per_img = max_box_per_img
-        # self.albumentations = Albumentations() if augment else None
 
         try:
             f = []  # image files
@@ -83,17 +78,14 @@ class LoadImagesAndLabels:  # for training/testing
                 p = Path(p)  # os-agnostic
                 if p.is_dir():  # dir
                     f += glob.glob(str(p / '**' / '*.*'), recursive=True)
-                    # f = list(p.rglob('**/*.*'))  # pathlib
                 elif p.is_file():  # file
                     with open(p, 'r') as t:
                         t = t.read().strip().splitlines()
                         parent = str(p.parent) + os.sep
                         f += [x.replace('./', parent) if x.startswith('./') else x for x in t]  # local to global path
-                        # f += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
                 else:
                     raise Exception(f'{prefix}{p} does not exist')
             self.img_files = sorted([x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in img_formats])
-            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in img_formats])  # pathlib
             assert self.img_files, f'{prefix}No images found'
         except Exception as e:
             raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {help_url}')
@@ -288,14 +280,8 @@ class LoadImagesAndLabels:  # for training/testing
                                                  shear=hyp['shear'],
                                                  perspective=hyp['perspective'])
 
-            # img, labels = self.albumentations(img, labels)
-
             # Augment colorspace
             augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
-
-            # Apply cutouts
-            # if random.random() < 0.9:
-            #     labels = cutout(img, labels)
 
             if random.random() < hyp['paste_in']:
                 sample_labels, sample_images, sample_masks = [], [], []
@@ -365,8 +351,6 @@ class LoadImagesAndLabels:  # for training/testing
                 _resize_shape = (img[i].shape[1] * 2, img[i].shape[2] * 2)
                 # (c,h,w) -> (h,w,c) -> (c,h,w)
                 im = vision.Resize(_resize_shape, Inter.BILINEAR)(img[i].transpose(1, 2, 0)).transpose(2, 0, 1)
-                # im = F.interpolate(img[i].unsqueeze(0).float(), scale_factor=2., mode='bilinear', align_corners=False)[
-                #     0].type(img[i].type())
                 l = label[i]
             else:
                 im = np.concatenate((np.concatenate((img[i], img[i + 1]), 1),
@@ -418,53 +402,4 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, epoch_size=300, hyp=
         math.ceil(len(dataset) / batch_size / rank_size)
 
     return ds, dataset, per_epoch_size
-
-
-if __name__ == '__main__':
-    # python train.py --workers 8 --device 0 --batch-size 32 --data data/coco.yaml
-    #   --img 640 640 --cfg cfg/training/yolov7.yaml --weights '' --name yolov7 --hyp data/hyp.scratch.p5.yaml
-    import yaml
-    from config.args import get_args
-    from utils.general import check_file, increment_path, colorstr
-
-    opt = get_args()
-    # opt.hyp = opt.hyp or ('hyp.finetune.yaml' if opt.weights else 'hyp.scratch.yaml')
-    opt.data, opt.cfg, opt.hyp = check_file(opt.data), check_file(opt.cfg), check_file(opt.hyp)  # check files
-    assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
-    opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
-    opt.name = 'evolve' if opt.evolve else opt.name
-    opt.save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok | opt.evolve)  # increment run
-    opt.total_batch_size = opt.batch_size
-
-    # Hyperparameters
-    with open(opt.hyp) as f:
-        hyp = yaml.load(f, Loader=yaml.SafeLoader)  # load hyps
-
-    # Train set
-    train_path = "/Users/zhanghuiyao/Desktop/coco/train2017.txt"
-    imgsz, _ = [640, 640]
-    batch_size = 2
-    gs = 32
-    ds, _, ds_size = create_dataloader(train_path, imgsz, batch_size, gs, opt, epoch_size=1,
-                                       hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect,
-                                       rank=0, rank_size=1,
-                                       num_parallel_workers=8, image_weights=opt.image_weights,
-                                       quad=opt.quad, prefix=colorstr('train: '))
-    data_loader = ds.create_dict_iterator(output_numpy=True, num_epochs=1)
-    max_shape = 0
-    for i, data in enumerate(data_loader):
-        imgs, label_outs, img_files = data["img"], data["label_out"], data["img_files"]
-        import pdb;pdb.set_trace()
-        print(f"{i}/{ds_size} label_outs: {label_outs.shape}")
-        if label_outs.shape[1] > max_shape:
-            max_shape = label_outs.shape[1]
-            print(f"max shape: {max_shape}")
-
-        # if i == 0:
-        #     print("imgs: ", imgs.shape)
-        #     print("label_outs: ", label_outs.shape)
-        #     print("img_files", img_files.shape)
-        # break
-    print(f"max shape: {max_shape}") # 158
-    print("Done!")
 

@@ -7,17 +7,6 @@ from mindspore.train.serialization import save_checkpoint
 from mindspore import Tensor
 
 
-# keys_ms_add = ['model.105.grid_cell.0.param', 'model.105.grid_cell.1.param', 'model.105.grid_cell.2.param']
-#
-# key_map = {
-#     'model.0.bn.running_mean': 'model.0.bn.moving_mean',
-#     'model.0.bn.running_var': 'model.0.bn.moving_variance',
-#     'model.0.bn.weight': 'model.0.bn.gamma',
-#     'model.0.bn.bias': 'model.0.bn.beta',
-#     "...": "..."
-# }
-
-
 def pytorch2mindspore(weight, is_model=False):
     torch_pth = weight
     new_params_list = []
@@ -57,7 +46,6 @@ def pytorch2mindspore(weight, is_model=False):
             if not "num_batches_tracked" in k:
                 print(f"Convert weight keys \"{k}\" not match.")
         else:
-            # new_par_dict[new_k] = Tensor(par_dict[k].numpy())
             _param_dict = {'name': new_k, 'data': Tensor(par_dict[k].numpy())}
             new_params_list.append(_param_dict)
 
@@ -108,8 +96,6 @@ def mindspore2pytorch(weight):
                 print(f"Convert weight keys \"{k}\" not match.")
         else:
             new_par_dict[new_k] = torch.tensor(par_dict[k].asnumpy())
-            # _param_dict = {'name': new_k, 'data': Tensor(par_dict[k].numpy())}
-            # new_params_list.append(_param_dict)
 
     torch_pt = f"ms2torch_{os.path.basename(weight)[:-len('.ckpt')]}.pt"
     torch.save(new_par_dict, torch_pt)

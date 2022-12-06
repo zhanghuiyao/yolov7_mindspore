@@ -4,19 +4,17 @@ import time
 import json
 import yaml
 import datetime
-import argparse
 import numpy as np
 from pathlib import Path
 from threading import Thread
-from tqdm import tqdm
 
 import mindspore as ms
 from mindspore import Tensor, ops, nn
 
 from network.yolo import Model
 from config.args import get_args_test
-from utils.general import xywh2xyxy, coco80_to_coco91_class, check_file, check_img_size, xyxy2xywh, xywh2xyxy, \
-    increment_path, colorstr, box_iou
+from utils.general import coco80_to_coco91_class, check_file, check_img_size, xyxy2xywh, xywh2xyxy, \
+    colorstr, box_iou
 from utils.dataset import create_dataloader
 from utils.metrics import ConfusionMatrix, non_max_suppression, scale_coords, ap_per_class
 from utils.plots import plot_study_txt, plot_images, output_to_target
@@ -190,8 +188,6 @@ def test(data,
 
                 # Per target class
                 for cls in np.unique(tcls_np):
-                    # ti = (cls == tcls_np).nonzero(as_tuple=False).view(-1)  # prediction indices
-                    # pi = (cls == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # target indices
                     ti = np.nonzero(cls == tcls_np)[0].reshape(-1) # prediction indices
                     pi = np.nonzero(cls == pred[:, 5])[0].reshape(-1) # target indices
 

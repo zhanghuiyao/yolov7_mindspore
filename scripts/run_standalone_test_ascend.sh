@@ -2,9 +2,9 @@
 
 if [ $# != 2 ] && [ $# != 5 ]
 then
-    echo "Usage: sh run_standalone_eval_gpu.sh [WEIGHTS] [DEVICE_ID]"
+    echo "Usage: bash run_standalone_test_ascend.sh [WEIGHTS] [DEVICE_ID]"
     echo "OR"
-    echo "Usage: sh run_standalone_eval_gpu.sh [WEIGHTS] [DEVICE_ID] [CONFIG_PATH] [DATA_PATH] [HYP_PATH]"
+    echo "Usage: bash run_standalone_test_ascend.sh [WEIGHTS] [DEVICE_ID] [CONFIG_PATH] [DATA_PATH] [HYP_PATH]"
 exit 1
 fi
 

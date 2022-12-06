@@ -22,7 +22,7 @@ import numpy as np
 import mindspore as ms
 from mindspore import Tensor, export, context
 
-from config.args import get_args_test
+from config.args import get_args_310
 from network.yolo import Model
 
 
@@ -51,14 +51,14 @@ def run_export(opt):
     param_dict = ms.load_checkpoint(opt.weights)
     ms.load_param_into_net(net, param_dict)
     print(f"load ckpt from \"{opt.weights}\" success.")
-    net.set_train(False)
+    net.set_train(True)
 
     # export
-    input_arr = Tensor(np.ones([opt.export_batch_size, 3, opt.img_size, opt.img_size]), ms.float32)
+    input_arr = Tensor(np.ones([opt.per_batch_size, 3, opt.img_size, opt.img_size]), ms.float32)
     file_name = os.path.basename(opt.cfg)[:-5] # delete ".yaml"
     export(net, input_arr, file_name=file_name, file_format=opt.file_format)
 
 
 if __name__ == '__main__':
-    opt = get_args_test()
+    opt = get_args_310()
     run_export(opt)

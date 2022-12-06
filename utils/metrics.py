@@ -103,8 +103,6 @@ def _nms(xyxys, scores, threshold, time_limit=-1, sample_idx=0):
         min_y2 = np.minimum(y2[i], y2[order[1:]])
 
         # zhy_test
-        # intersect_w = np.maximum(0.0, min_x2 - max_x1 + 1)
-        # intersect_h = np.maximum(0.0, min_y2 - max_y1 + 1)
         intersect_w = np.maximum(0.0, min_x2 - max_x1)
         intersect_h = np.maximum(0.0, min_y2 - max_y1)
         intersect_area = intersect_w * intersect_h
@@ -141,7 +139,6 @@ def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=Non
     output = [np.zeros((0, 6))] * prediction.shape[0]
     for xi, x in enumerate(prediction):  # image index, image inference
         # Apply constraints
-        # x[((x[..., 2:4] < min_wh) | (x[..., 2:4] > max_wh)).any(1), 4] = 0  # width-height
         x = x[xc[xi]]  # confidence
 
         # Cat apriori labels if autolabelling
@@ -216,7 +213,6 @@ def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None):
         gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain  = old / new
         pad = (img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2  # wh padding
     else:
-        # assert ratio_pad[0, 0] == ratio_pad[0, 1]
         gain = ratio_pad[0, 0]
         pad = ratio_pad[1, :]
 

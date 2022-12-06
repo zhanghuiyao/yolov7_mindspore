@@ -4,12 +4,9 @@ from pathlib import Path
 from copy import deepcopy
 
 import mindspore as ms
-import mindspore.numpy as mnp
 from mindspore import nn, ops, Tensor
-from mindspore.common.initializer import HeUniform
 
 import os, sys
-# sys.path.insert(0, "/disk3/zhy/_YOLO/yolo_mindspore")
 dir_path = os.path.dirname(os.path.realpath(__file__))
 parent_dir_path = os.path.abspath(os.path.join(dir_path, os.pardir))
 sys.path.insert(0, parent_dir_path)
@@ -18,16 +15,6 @@ sys.path.insert(0, parent_dir_path)
 from utils.autoanchor import check_anchor_order
 from network.common import parse_model, IDetect
 
-
-def initialize_weights(model):
-    for n, m in model.cells_and_names():
-        if isinstance(m, nn.Conv2d):
-            pass  # nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-        elif isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)):
-            pass
-            # This modification is invalid.
-            # m.eps = 1e-3
-            # m.momentum = 0.03
 
 @ops.constexpr
 def _get_h_w_list(ratio, gs, hw):
@@ -44,7 +31,6 @@ def scale_img(img, ratio=1.0, same_shape=False, gs=32):  # img(16,3,256,416)
         if not same_shape:  # pad/crop img
             h, w = _get_h_w_list(ratio, gs, (h, w))
 
-        # img = F.pad(img, [0, w - s[1], 0, h - s[0]], value=0.447)  # value = imagenet mean
         img = ops.pad(img, ((0, 0), (0, 0), (0, w - s[1]), (0, h - s[0])))
         img[:, :, -(w - s[1]):, :] = 0.447
         img[:, :, :, -(h - s[0]):] = 0.447
@@ -76,7 +62,6 @@ class Model(nn.Cell):
             self.yaml['anchors'] = round(anchors)  # override yaml value
         self.model, self.save, self.layers_param = parse_model(deepcopy(self.yaml), ch=[ch], sync_bn=sync_bn)
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
-        # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
 
         # Recompute
         if opt is not None:
@@ -89,18 +74,12 @@ class Model(nn.Cell):
         # Build strides, anchors
         m = self.model[-1]  # Detect()
         if isinstance(m, IDetect):
-            s = 256  # 2x min stride
-            # m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
             m.stride = Tensor(np.array(self.yaml['stride']), ms.int32)
             check_anchor_order(m)
             m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
             self.stride_np = np.array(self.yaml['stride'])
             self._initialize_biases()  # only run once
-            # print('Strides: %s' % m.stride.tolist())
-
-        # Init weights, biases
-        initialize_weights(self.model)
 
     def construct(self, x, augment=False):
         if augment:
@@ -110,9 +89,7 @@ class Model(nn.Cell):
             y = ()  # outputs
             for si, fi in zip(s, f):
                 xi = scale_img(ops.ReverseV2(fi)(x) if fi else x, si, gs=_get_stride_max(self.stride_np))
-                # xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
                 yi = self.forward_once(xi)[0]  # forward
-                # cv2.imwrite(f'img_{si}.jpg', 255 * xi[0].cpu().numpy().transpose((1, 2, 0))[:, :, ::-1])  # save
                 yi[..., :4] /= si  # de-scale
                 if fi == 2:
                     yi[..., 1] = img_size[0] - yi[..., 1]  # de-flip ud
@@ -130,7 +107,6 @@ class Model(nn.Cell):
             iol, f, _, _ = self.layers_param[i] # iol: index of layers
 
             if not(isinstance(f, int) and f == -1): # if not from previous layer
-                # x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
                 if isinstance(f, int):
                     x = y[f]
                 else:
@@ -146,7 +122,6 @@ class Model(nn.Cell):
                 if isinstance(m, IDetect):
                     break
 
-            # print("index m: ", iol) # print if debug on pynative mode, not available on graph mode.
             x = m(x)  # run
 
             y += (x if iol in self.save else None,)  # save output
@@ -155,7 +130,6 @@ class Model(nn.Cell):
 
     def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
         # https://arxiv.org/abs/1708.02002 section 3.3
-        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
         m = self.model[-1]  # Detect() module
         for mi, s in zip(m.m, m.stride):  # from
             s = s.asnumpy()
@@ -163,16 +137,3 @@ class Model(nn.Cell):
             b[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
             b[:, 5:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else np.log(cf / cf.sum())  # cls
             mi.bias = ops.assign(mi.bias, Tensor(b, ms.float32).view(-1))
-
-
-if __name__ == '__main__':
-    from mindspore import context
-    context.set_context(mode=context.GRAPH_MODE, pynative_synchronize=True)
-    cfg = "./config/network_yolov7/yolov7.yaml"
-    model = Model(cfg, ch=3, nc=80, anchors=None)
-    for p in model.trainable_params():
-        print(p.name)
-    # model.set_train(True)
-    # x = Tensor(np.random.randn(1, 3, 160, 160), ms.float32)
-    # pred = model(x)
-    # print(pred)

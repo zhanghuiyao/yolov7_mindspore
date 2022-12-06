@@ -17,8 +17,8 @@ pre-process for inference
 """
 import os
 import yaml
-
-from config.args import get_args_export
+import numpy as np
+from config.args import get_args_310
 from utils.dataset import create_dataloader
 from utils.general import colorstr
 
@@ -33,10 +33,9 @@ def preprocess(opt):
         hyp = yaml.load(f, Loader=yaml.SafeLoader)  # load hyps
     with open(opt.cfg) as f:
         cfg_ymal = yaml.load(f, Loader=yaml.SafeLoader)  # model dict
-    # gs = max(int(ops.cast(model.stride, ms.float16).max()), 32)  # grid size (max stride)
     gs = max(max(cfg_ymal['stride']), 32)
     task = 'val'
-    dataloader, _, per_epoch_size = create_dataloader(data[task], opt.img_size, opt.export_batch_size, gs, opt,
+    dataloader, _, per_epoch_size = create_dataloader(data[task], opt.img_size, opt.per_batch_size, gs, opt,
                                                             epoch_size=1, pad=0.5, rect=False,
                                                             num_parallel_workers=8, shuffle=False,
                                                             drop_remainder=False,
@@ -50,8 +49,8 @@ def preprocess(opt):
         os.makedirs(img_path)
 
     for i, meta_data in enumerate(data_loader):
-        img, targets, paths, shapes = meta_data["img"], meta_data["label_out"],\
-                                      meta_data["img_files"], meta_data["shapes"]
+        img = meta_data["img"].astype(np.float32)
+        img /= 255.0
         file_name = f"{i}.bin"
         img_file_path = os.path.join(img_path, file_name)
         img.tofile(img_file_path)
@@ -60,5 +59,5 @@ def preprocess(opt):
 
 
 if __name__ == '__main__':
-    opt = get_args_export()
+    opt = get_args_310()
     preprocess(opt)
