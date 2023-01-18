@@ -3,9 +3,9 @@ __BASE__: [
   '../hyp/hyp.scratch.p5.yaml',
 ]
 
-run_eval: True
-recompute: True
-recompute_layers: 5
+run_eval: False
+recompute: False
+recompute_layers: 0
 batch_size: 128
 
 

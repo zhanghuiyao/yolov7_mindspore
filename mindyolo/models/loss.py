@@ -449,392 +449,6 @@ class ComputeLoss(nn.Cell):
                ops.stack(anch), \
                ops.stack(tmasks) # class, box, (image, anchor, gridj, gridi), anchors, mask
 
-class ComputeLossOTA_dynamic(nn.Cell):
-    # run with mindspore version 2.0.0
-    def __init__(self, model, autobalance=False):
-        super(ComputeLossOTA_dynamic, self).__init__()
-        h = model.opt
-        self.hyp_box = h.box
-        self.hyp_obj = h.obj
-        self.hyp_cls = h.cls
-        self.hyp_anchor_t = h.anchor_t
-
-        # Class label smoothing https://arxiv.org/pdf/1902.04103.pdf eqn 3
-        self.cp, self.cn = smooth_BCE(eps=h.label_smoothing)  # positive, negative BCE targets
-        # Focal loss
-        g = h.fl_gamma  # focal loss gamma
-        if g > 0:
-            BCEcls, BCEobj = FocalLoss(bce_pos_weight=Tensor([h.cls_pw], ms.float32), gamma=g), \
-                             FocalLoss(bce_pos_weight=Tensor([h.obj_pw], ms.float32), gamma=g)
-        else:
-            # Define criteria
-            BCEcls = BCEWithLogitsLoss(bce_pos_weight=Tensor(np.array([h.cls_pw]), ms.float32))
-            BCEobj = BCEWithLogitsLoss(bce_pos_weight=Tensor(np.array([h.obj_pw]), ms.float32))
-
-        m = model.model[-1]  # Detect() module
-        _balance = {3: [4.0, 1.0, 0.4]}.get(m.nl, [4.0, 1.0, 0.25, 0.06, 0.02])  # P3-P7
-        self.balance = ms.Parameter(Tensor(_balance, ms.float32), requires_grad=False)
-        self.ssi = list(m.stride).index(16) if autobalance else 0  # stride 16 index
-        self.BCEcls, self.BCEobj, self.gr, self.autobalance = BCEcls, BCEobj, 1.0, autobalance
-
-        self.na = m.na  # number of anchors
-        self.nc = m.nc  # number of classes
-        self.nl = m.nl  # number of layers
-        self.anchors = m.anchors
-        self.stride = m.stride
-
-        self._off = Tensor([
-            [0, 0],
-            [1, 0],
-            [0, 1],
-            [-1, 0],
-            [0, -1],  # j,k,l,m
-            # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
-        ], dtype=ms.float32)
-
-    def construct(self, p, targets, imgs):
-        lcls, lbox, lobj = 0., 0., 0.
-        bs, as_, gjs, gis, targets, anchors = self.build_targets(p, targets, imgs) # bs: (nl, bs*5*na*gt_max)
-        bs, as_, gjs, gis, targets, anchors = ops.stop_gradient(bs), ops.stop_gradient(as_), \
-                                              ops.stop_gradient(gjs), ops.stop_gradient(gis), \
-                                              ops.stop_gradient(targets), ops.stop_gradient(anchors)
-        pre_gen_gains = ()
-        for pp in p:
-            pre_gen_gains += (get_tensor(pp.shape, pp.dtype)[[3, 2, 3, 2]],)
-
-        # Losses
-        for i, pi in enumerate(p):  # layer index, layer predictions
-            b, a, gj, gi = bs[i], as_[i], gjs[i], gis[i]  # image, anchor, gridy, gridx, tmask
-            tobj = ops.zeros_like(pi[..., 0])  # target obj
-
-            n = b.shape[0]  # number of targets
-            ps = pi[b, a, gj, gi]  # prediction subset corresponding to targets
-
-            # Regression
-            grid = ops.stack([gi, gj], axis=1)
-            pxy = ops.Sigmoid()(ps[:, :2]) * 2. - 0.5
-            pwh = (ops.Sigmoid()(ps[:, 2:4]) * 2) ** 2 * anchors[i]
-            pbox = ops.concat((pxy, pwh), 1)  # predicted box
-            selected_tbox = targets[i][:, 2:6] * pre_gen_gains[i]
-
-            # selected_tbox[:, 0:2] -= grid
-            # _selected_tbox_1, _selected_tbox_2 = ops.split(selected_tbox, 1, 2) # ms 1.8.1
-            _selected_tbox_1, _selected_tbox_2 = ops.split(selected_tbox, 2, 1) # ms 2.0.0
-            _selected_tbox_1 -= grid
-            selected_tbox = ops.concat((_selected_tbox_1, _selected_tbox_2), 1)
-
-            iou = bbox_iou_2(pbox, selected_tbox, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
-            lbox += (1.0 - iou).mean() # iou loss
-
-            # Objectness
-            tobj[b, a, gj, gi] = ops.ones(iou.shape, iou.dtype) * \
-                                 ((1.0 - self.gr) + self.gr * ops.stop_gradient(iou).clip(0, None)) # iou ratio
-
-            # Classification
-            selected_tcls = ops.cast(targets[i][:, 1], ms.int32)
-            if self.nc > 1:  # cls loss (only if multiple classes)
-                t = ops.ones_like(ps[:, 5:]) * self.cn # targets
-                t[mnp.arange(n), selected_tcls.view(n)] = self.cp
-                lcls += self.BCEcls(ps[:, 5:], t)  # BCE
-
-            obji = self.BCEobj(pi[..., 4], tobj)
-            lobj += obji * self.balance[i]  # obj loss
-            if self.autobalance:
-                self.balance[i] = self.balance[i] * 0.9999 + 0.0001 / ops.stop_gradient(obji)
-
-        if self.autobalance:
-            _balance_ssi = self.balance[self.ssi]
-            self.balance /= _balance_ssi
-        lbox *= self.hyp_box
-        lobj *= self.hyp_obj
-        lcls *= self.hyp_cls
-        bs = p[0].shape[0]  # batch size
-
-        loss = lbox + lobj + lcls
-        return loss * bs, ops.stop_gradient(ops.stack((lbox, lobj, lcls, loss)))
-
-    def build_targets(self, p, targets, imgs):
-        indices, anch = self.find_3_positive(p, targets) # 3 * (4, nm_2), 3 * (nm_2, 2)
-        nl, batch_size, img_size = len(p), p[0].shape[0], imgs[0].shape[1]
-        targets = targets.view(-1, 6)  # (bs, gt_max, 6) -> (bs*gt_max, 6)
-        mask_t = targets[:, 1] >= 0  # (bs*gt_max,)
-        targets = ops.masked_select(targets, ops.tile(mask_t[:, None], (1, 6))).view(-1, 6)  # (nt, 6)
-
-        matching_bs = ()
-        matching_as = ()
-        matching_gjs = ()
-        matching_gis = ()
-        matching_targets = ()
-        matching_anchs = ()
-        matching_from_which_layers = ()
-
-        for batch_idx in range(p[0].shape[0]):
-            b_idx = (targets[:, 0] == batch_idx) # (n_tb,)
-            # this_target = ops.masked_select(targets, ops.tile(b_idx[:, None], (1, 6))).view(-1, 6) # (n_tb, 6)
-            this_target = ops.masked_select(targets, ops.broadcast_to(b_idx[:, None], b_idx.shape + (6,))).view(-1, 6)  # (n_tb, 6)
-            if this_target.shape[0] == 0:
-                continue
-
-            txywh = this_target[:, 2:6] * imgs[batch_idx].shape[1] # (n_tb, 4)
-            txyxy = self.xywh2xyxy(txywh)
-            pxyxys = ()
-            p_cls = ()
-            p_obj = ()
-            from_which_layer = ()
-            all_b = ()
-            all_a = ()
-            all_gj = ()
-            all_gi = ()
-            all_anch = ()
-
-            for i, pi in enumerate(p):
-                # b, a, gj, gi = indices[i]
-                # b, a, gj, gi = ops.split(indices[i], 0, 4) # ms 1.8.1
-                b, a, gj, gi = ops.split(indices[i], 1, 0)  # ms 2.0.0
-                b, a, gj, gi = b.view(-1), a.view(-1), gj.view(-1), gi.view(-1)
-
-                idx = (b == batch_idx) # (n_tp_b,)
-                b, a, gj, gi = ops.masked_select(b, idx), ops.masked_select(a, idx), \
-                               ops.masked_select(gj, idx), ops.masked_select(gi, idx)
-                # _this_anch = ops.masked_select(anch[i], ops.tile(idx[:, None], (1, 2))).view(-1, 2) # (n_tp_b, 2)
-                _this_anch = ops.masked_select(anch[i], ops.broadcast_to(idx[:, None], idx.shape + (2,))).view(-1, 2)  # (n_tp_b, 2)
-                all_b += (b,)
-                all_a += (a,)
-                all_gj += (gj,)
-                all_gi += (gi,)
-                all_anch += (_this_anch,)
-                from_which_layer += (ops.ones((b.shape[0],), ms.int32) * i,)
-
-                fg_pred = pi[b, a, gj, gi] # (n_tp_b, 85)
-                p_obj += (fg_pred[:, 4:5],)
-                p_cls += (fg_pred[:, 5:],)
-
-                grid = ops.stack((gi, gj), axis=1) # (n_tp_b, 2)
-                pxy = (ops.Sigmoid()(fg_pred[:, :2]) * 2. - 0.5 + grid) * self.stride[i]  # / 8.
-                pwh = (ops.Sigmoid()(fg_pred[:, 2:4]) * 2) ** 2 * _this_anch * self.stride[i]  # / 8.
-                pxywh = ops.concat((pxy, pwh), axis=-1) # (n_tp_b, 4)
-                pxyxy = self.xywh2xyxy(pxywh)
-                pxyxys += (pxyxy,)
-
-            pxyxys = ops.concat(pxyxys, axis=0) # (n_tp, 4)
-            if pxyxys.shape[0] == 0:
-                continue
-            p_obj = ops.concat(p_obj, axis=0) # (n_tp, 1)
-            p_cls = ops.concat(p_cls, axis=0) # (n_tp, 80)
-            from_which_layer = ops.concat(from_which_layer, axis=0)
-            all_b = ops.concat(all_b, axis=0) # (n_tp,)
-            all_a = ops.concat(all_a, axis=0)
-            all_gj = ops.concat(all_gj, axis=0)
-            all_gi = ops.concat(all_gi, axis=0)
-            all_anch = ops.concat(all_anch, axis=0) # (n_tp, 2)
-
-            pair_wise_iou = box_iou(txyxy, pxyxys) # (n_tb, 4), (n_tp, 4) -> (n_tb, n_tp)
-            pair_wise_iou_loss = -ops.log(pair_wise_iou + 1e-8)
-
-            v, _ = ops.top_k(pair_wise_iou, min(10, pair_wise_iou.shape[1])) # (n_tb, 10)
-            dynamic_ks = v.sum(1).astype(ms.int32).clip(1, None) # (n_tb,)
-
-            gt_cls_per_image = ops.one_hot(indices=ops.cast(this_target[:, 1], ms.int32),
-                                           depth=self.nc,
-                                           on_value=ops.ones(1, pair_wise_iou.dtype),
-                                           off_value=ops.zeros(1, pair_wise_iou.dtype)) # (n_tb, 80)
-            # gt_cls_per_image = ops.tile(gt_cls_per_image[:, None, :], (1, pxyxys.shape[0], 1)) # (n_tb, n_tp, 85)
-            gt_cls_per_image = ops.broadcast_to(gt_cls_per_image[:, None, :], (gt_cls_per_image.shape[0], pxyxys.shape[0], gt_cls_per_image.shape[1]))  # (n_tb, n_tp, 85)
-
-            num_gt = this_target.shape[0]
-            # cls_preds_ = ops.Sigmoid()(ops.tile(p_cls[None, :, :], (num_gt, 1, 1))) * \
-            #              ops.Sigmoid()(ops.tile(p_obj[None, :, :], (num_gt, 1, 1))) # (n_tb, n_tp, 80)
-            cls_preds_ = ops.Sigmoid()(ops.broadcast_to(p_cls[None, :, :], (num_gt,) + p_cls.shape)) * \
-                         ops.Sigmoid()(ops.broadcast_to(p_obj[None, :, :], (num_gt,) + p_obj.shape))  # (n_tb, n_tp, 80)
-
-            y = ops.sqrt(cls_preds_)
-            pair_wise_cls_loss = ops.binary_cross_entropy_with_logits(
-                ops.log(y / (1 - y)),
-                gt_cls_per_image,
-                ops.ones(1, cls_preds_.dtype),
-                ops.ones(1, cls_preds_.dtype),
-                reduction="none",
-            ).sum(-1)
-
-            cost = pair_wise_cls_loss + 3.0 * pair_wise_iou_loss  # (n_tb, n_tp)
-
-            # 1. dynamic-k match with pynative and dynamic-shape
-            matching_matrix = ops.zeros_like(cost)
-            for gt_idx in range(num_gt):
-                _, pos_idx = ops.top_k(
-                    cost[gt_idx], k=int(dynamic_ks[gt_idx].asnumpy())
-                )
-                matching_matrix[gt_idx][pos_idx] = 1.0
-
-            # 2. dynamic-k match with pynative and static-shape
-            # sort_cost, sort_idx = ops.top_k(-cost, 10, sorted=True)
-            # sort_cost = -sort_cost
-            # pos_idx = ops.stack((mnp.arange(cost.shape[0]), dynamic_ks - 1), -1)
-            # pos_v = ops.gather_nd(sort_cost, pos_idx)
-            # matching_matrix = ops.cast(cost <= pos_v[:, None], ms.int32)
-
-            anchor_matching_gt = matching_matrix.sum(0)  # (n_tp,)
-            anchor_matching_mask = anchor_matching_gt > 1  # (n_tp,)
-            anchor_matching_mask_idx = ops.masked_select(mnp.arange(cost.shape[1]), anchor_matching_mask)
-            if anchor_matching_mask.astype(cost.dtype).sum() > 0:
-                # cost_argmin = ops.argmin(ops.masked_select(cost,
-                #                                            ops.tile(anchor_matching_mask[None, :], (cost.shape[0], 1))
-                #                                            ).view(cost.shape[0], -1), axis=0)
-                cost_argmin = ops.argmin(ops.masked_select(cost,
-                                                           ops.broadcast_to(anchor_matching_mask[None, :], (cost.shape[0],) + anchor_matching_mask.shape)
-                                                           ).view(cost.shape[0], -1), axis=0)
-                # matching_matrix[:, anchor_matching_mask_idx] *= 0.0
-                matching_matrix *= 1 - anchor_matching_mask.astype(matching_matrix.dtype)
-                matching_matrix[cost_argmin, anchor_matching_mask_idx] = 1.0
-            fg_mask_inboxes = matching_matrix.sum(0) > 0.0 # (n_tp,)
-
-            if fg_mask_inboxes.astype(cost.dtype).sum() > 0.0:
-                fg_mask_inboxes_idx = ops.masked_select(mnp.arange(cost.shape[1]), fg_mask_inboxes) # (n_tp_m,)
-
-                # matched_gt_inds = matching_matrix[:, fg_mask_inboxes_idx].argmax(0) # (n_tb, n_tp) -> (n_tb, n_tp_m,) -> (n_tp_m,)
-                matched_gt_inds = matching_matrix.transpose(1, 0)[fg_mask_inboxes_idx].argmax(1) # (n_tb, n_tp) -> (n_tp, n_tb) -> (n_tp_m, n_tb) -> (n_tp_m,)
-
-                from_which_layer = from_which_layer[fg_mask_inboxes_idx] # (n_tp,) -> (n_tp_m,)
-                all_b = all_b[fg_mask_inboxes_idx]
-                all_a = all_a[fg_mask_inboxes_idx]
-                all_gj = all_gj[fg_mask_inboxes_idx]
-                all_gi = all_gi[fg_mask_inboxes_idx]
-                all_anch = all_anch[fg_mask_inboxes_idx]
-
-                this_target = this_target[matched_gt_inds] # (n_tb, 6) -> (n_tp_m, 6)
-
-                matching_from_which_layers += (from_which_layer,)
-                matching_bs += (all_b,)
-                matching_as += (all_a,)
-                matching_gjs += (all_gj,)
-                matching_gis += (all_gi,)
-                matching_targets += (this_target,)
-                matching_anchs += (all_anch,)
-
-        matching_bs = ops.concat(matching_bs, 0)
-        matching_as = ops.concat(matching_as, 0)
-        matching_gjs = ops.concat(matching_gjs, 0)
-        matching_gis = ops.concat(matching_gis, 0)
-        matching_targets = ops.concat(matching_targets, 0)
-        matching_anchs = ops.concat(matching_anchs, 0)
-        matching_from_which_layers = ops.concat(matching_from_which_layers, 0)
-
-        _matching_bs = ()
-        _matching_as = ()
-        _matching_gjs = ()
-        _matching_gis = ()
-        _matching_targets = ()
-        _matching_anchs = ()
-        _matching_from_which_layers = ()
-
-        for i in range(nl):
-            layer_mask = matching_from_which_layers == i
-            if layer_mask.astype(ms.float16).sum() > 0.0:
-                layer_idx = ops.masked_select(mnp.arange(matching_bs.shape[0]), layer_mask)
-                _matching_bs += (ops.stop_gradient(matching_bs[layer_idx]),)
-                _matching_as += (ops.stop_gradient(matching_as[layer_idx]),)
-                _matching_gjs += (ops.stop_gradient(matching_gjs[layer_idx]),)
-                _matching_gis += (ops.stop_gradient(matching_gis[layer_idx]),)
-                _matching_targets += (ops.stop_gradient(matching_targets[layer_idx]),)
-                _matching_anchs += (ops.stop_gradient(matching_anchs[layer_idx]),)
-            else:
-                _matching_bs += (Tensor([], matching_bs.dtype),)
-                _matching_as += (Tensor([], matching_as.dtype),)
-                _matching_gjs += (Tensor([], matching_gjs.dtype),)
-                _matching_gis += (Tensor([], matching_gis.dtype),)
-                _matching_targets += (Tensor([], matching_targets.dtype),)
-                _matching_anchs += (Tensor([], matching_anchs.dtype),)
-
-        return _matching_bs, _matching_as, _matching_gjs, _matching_gis, _matching_targets, _matching_anchs
-
-    def xywh2xyxy(self, x):
-        # Convert nx4 boxes from [x, y, w, h] to [x1, y1, x2, y2] where xy1=top-left, xy2=bottom-right
-        y = ops.zeros(x.shape, x.dtype)
-        y[:, 0] = x[:, 0] - x[:, 2] / 2  # top left x
-        y[:, 1] = x[:, 1] - x[:, 3] / 2  # top left y
-        y[:, 2] = x[:, 0] + x[:, 2] / 2  # bottom right x
-        y[:, 3] = x[:, 1] + x[:, 3] / 2  # bottom right y
-        return y
-
-    def find_3_positive(self, p, targets):
-        # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
-        targets = targets.view(-1, 6) # (bs, gt_max, 6) -> (bs*gt_max, 6)
-        mask_t = targets[:, 1] >= 0 # (bs*gt_max,)
-
-        # targets = ops.masked_select(targets, ops.tile(mask_t[:, None], (1, 6))).view(-1, 6) # (nt, 6)
-        targets = ops.masked_select(targets, ops.broadcast_to(mask_t[:, None], mask_t.shape + (6,))).view(-1, 6)  # (nt, 6)
-
-        na, nt = self.na, targets.shape[0]  # number of anchors, targets
-        indices, anch, tmasks = (), (), ()
-        gain = ops.ones(7, ms.int32)  # normalized to gridspace gain
-
-        # ai = ops.tile(mnp.arange(na, dtype=targets.dtype).view(na, 1), (1, nt)) # shape: (na, nt)
-        ai = ops.broadcast_to(mnp.arange(na, dtype=targets.dtype).view(na, 1), (na, nt))
-
-        # (na, nt, 7)
-        # targets = ops.concat((ops.tile(targets[None, :, :], (na, 1, 1)), ai[:, :, None]), 2)  # append anchor indices # not support dynamic shape
-        targets = ops.concat((ops.broadcast_to(targets[None, :, :], (na,) + targets.shape[:]), ai[:, :, None]), 2) # append anchor indices
-
-        g = 0.5  # bias
-        off = ops.cast(self._off, targets.dtype) * g  # offsets
-
-        for i in range(self.nl):
-            anchors, shape = self.anchors[i], p[i].shape
-            gain[2:6] = get_tensor(shape, targets.dtype)[[3, 2, 3, 2]]  # xyxy gain # [W, H, W, H]
-
-            # Match targets to anchors
-            t = targets * gain # (na, nt, 7)
-            # Matches
-            if nt:
-                r = t[:, :, 4:6] / anchors[:, None, :]  # wh ratio # (na, nt, 2)
-                j = ops.maximum(r, 1. / r).max(2) < self.hyp_anchor_t  # compare # (na, nt)
-
-                # t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7) # (nm, 7)
-                t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm, 7)
-
-                # t = t[j]  # filter
-
-                # Offsets
-                gxy = t[:, 2:4]  # grid xy # (nm, 2)
-                gxi = gain[[2, 3]] - gxy  # inverse
-                jk = ops.logical_and((gxy % 1 < g), (gxy > 1))
-                lm = ops.logical_and((gxi % 1 < g), (gxi > 1))
-                j, k = jk[:, 0], jk[:, 1] # (nm,)
-                l, m = lm[:, 0], lm[:, 1]
-
-                # original
-                j = ops.stack((ops.ones_like(j), j, k, l, m))  # shape: (5, nm)
-
-                # t = ops.tile(t, (5, 1, 1))  # shape(5, nm, 7)
-                # t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7)  # (nm_2, 7)
-                t = ops.broadcast_to(t, (5,) + t.shape)
-                t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm_2, 7)
-
-                offsets = ops.zeros_like(gxy)[None, :, :] + off[:, None, :] # (5, nm, 2)
-                # offsets = ops.masked_select(offsets, ops.tile(j[:, :, None], (1, 1, 2))).view(-1, 2)
-                offsets = ops.masked_select(offsets, ops.broadcast_to(j[:, :, None], j.shape + (2,))).view(-1, 2)
-            else:
-                t = targets[0]
-                offsets = 0
-                print("warning: find_3_pos: this batch has no target!")
-
-            # Define # (nm_2,)
-            b, c, gxy, gwh, a = ops.cast(t[:, 0], ms.int32), \
-                                ops.cast(t[:, 1], ms.int32), \
-                                t[:, 2:4], \
-                                t[:, 4:6], \
-                                ops.cast(t[:, 6], ms.int32)  # (image, class), grid xy, grid wh, anchors # b: (5*na*nt,), gxy: (5*na*nt, 2)
-            gij = ops.cast(gxy - offsets, ms.int32)
-            gi, gj = gij[:, 0], gij[:, 1]  # grid indices
-            gi = gi.clip(0, shape[3] - 1)
-            gj = gj.clip(0, shape[2] - 1)
-
-            # Append
-            indices += (ops.stack((b, a, gj, gi), 0),)  # image, anchor, grid
-            anch += (anchors[a],)  # anchors
-
-        return indices, anch
-
 class ComputeLossOTA(nn.Cell):
     def __init__(self, model, autobalance=False):
         super(ComputeLossOTA, self).__init__()
@@ -1732,6 +1346,1087 @@ class ComputeLossAuxOTA(nn.Cell):
             tmasks += (mask_m_t,)
 
         return indices, anch, tmasks
+
+class ComputeLossOTA_dynamic(nn.Cell):
+    # run with mindspore version 2.0.0
+    def __init__(self, model, autobalance=False):
+        super(ComputeLossOTA_dynamic, self).__init__()
+        h = model.opt
+        self.hyp_box = h.box
+        self.hyp_obj = h.obj
+        self.hyp_cls = h.cls
+        self.hyp_anchor_t = h.anchor_t
+
+        # Class label smoothing https://arxiv.org/pdf/1902.04103.pdf eqn 3
+        self.cp, self.cn = smooth_BCE(eps=h.label_smoothing)  # positive, negative BCE targets
+        # Focal loss
+        g = h.fl_gamma  # focal loss gamma
+        if g > 0:
+            BCEcls, BCEobj = FocalLoss(bce_pos_weight=Tensor([h.cls_pw], ms.float32), gamma=g), \
+                             FocalLoss(bce_pos_weight=Tensor([h.obj_pw], ms.float32), gamma=g)
+        else:
+            # Define criteria
+            BCEcls = BCEWithLogitsLoss(bce_pos_weight=Tensor(np.array([h.cls_pw]), ms.float32))
+            BCEobj = BCEWithLogitsLoss(bce_pos_weight=Tensor(np.array([h.obj_pw]), ms.float32))
+
+        m = model.model[-1]  # Detect() module
+        _balance = {3: [4.0, 1.0, 0.4]}.get(m.nl, [4.0, 1.0, 0.25, 0.06, 0.02])  # P3-P7
+        self.balance = ms.Parameter(Tensor(_balance, ms.float32), requires_grad=False)
+        self.ssi = list(m.stride).index(16) if autobalance else 0  # stride 16 index
+        self.BCEcls, self.BCEobj, self.gr, self.autobalance = BCEcls, BCEobj, 1.0, autobalance
+
+        self.na = m.na  # number of anchors
+        self.nc = m.nc  # number of classes
+        self.nl = m.nl  # number of layers
+        self.anchors = m.anchors
+        self.stride = m.stride
+
+        self._off = Tensor([
+            [0, 0],
+            [1, 0],
+            [0, 1],
+            [-1, 0],
+            [0, -1],  # j,k,l,m
+            # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
+        ], dtype=ms.float32)
+
+    def construct(self, p, targets, imgs):
+        lcls, lbox, lobj = 0., 0., 0.
+        bs, as_, gjs, gis, targets, anchors = self.build_targets(p, targets, imgs) # bs: (nl, bs*5*na*gt_max)
+        bs, as_, gjs, gis, targets, anchors = ops.stop_gradient(bs), ops.stop_gradient(as_), \
+                                              ops.stop_gradient(gjs), ops.stop_gradient(gis), \
+                                              ops.stop_gradient(targets), ops.stop_gradient(anchors)
+        pre_gen_gains = ()
+        for pp in p:
+            pre_gen_gains += (get_tensor(pp.shape, pp.dtype)[[3, 2, 3, 2]],)
+
+        # Losses
+        for i, pi in enumerate(p):  # layer index, layer predictions
+            b, a, gj, gi = bs[i], as_[i], gjs[i], gis[i]  # image, anchor, gridy, gridx, tmask
+            tobj = ops.zeros_like(pi[..., 0])  # target obj
+
+            n = b.shape[0]  # number of targets
+            ps = pi[b, a, gj, gi]  # prediction subset corresponding to targets
+
+            # Regression
+            grid = ops.stack([gi, gj], axis=1)
+            pxy = ops.Sigmoid()(ps[:, :2]) * 2. - 0.5
+            pwh = (ops.Sigmoid()(ps[:, 2:4]) * 2) ** 2 * anchors[i]
+            pbox = ops.concat((pxy, pwh), 1)  # predicted box
+            selected_tbox = targets[i][:, 2:6] * pre_gen_gains[i]
+
+            # selected_tbox[:, 0:2] -= grid
+            # _selected_tbox_1, _selected_tbox_2 = ops.split(selected_tbox, 1, 2) # ms 1.8.1
+            _selected_tbox_1, _selected_tbox_2 = ops.split(selected_tbox, 2, 1) # ms 2.0.0
+            _selected_tbox_1 -= grid
+            selected_tbox = ops.concat((_selected_tbox_1, _selected_tbox_2), 1)
+
+            iou = bbox_iou_2(pbox, selected_tbox, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
+            lbox += (1.0 - iou).mean() # iou loss
+
+            # Objectness
+            tobj[b, a, gj, gi] = ops.ones(iou.shape, iou.dtype) * \
+                                 ((1.0 - self.gr) + self.gr * ops.stop_gradient(iou).clip(0, None)) # iou ratio
+
+            # Classification
+            selected_tcls = ops.cast(targets[i][:, 1], ms.int32)
+            if self.nc > 1:  # cls loss (only if multiple classes)
+                t = ops.ones_like(ps[:, 5:]) * self.cn # targets
+                t[mnp.arange(n), selected_tcls.view(n)] = self.cp
+                lcls += self.BCEcls(ps[:, 5:], t)  # BCE
+
+            obji = self.BCEobj(pi[..., 4], tobj)
+            lobj += obji * self.balance[i]  # obj loss
+            if self.autobalance:
+                self.balance[i] = self.balance[i] * 0.9999 + 0.0001 / ops.stop_gradient(obji)
+
+        if self.autobalance:
+            _balance_ssi = self.balance[self.ssi]
+            self.balance /= _balance_ssi
+        lbox *= self.hyp_box
+        lobj *= self.hyp_obj
+        lcls *= self.hyp_cls
+        bs = p[0].shape[0]  # batch size
+
+        loss = lbox + lobj + lcls
+        return loss * bs, ops.stop_gradient(ops.stack((lbox, lobj, lcls, loss)))
+
+    def build_targets(self, p, targets, imgs):
+        indices, anch = self.find_3_positive(p, targets) # 3 * (4, nm_2), 3 * (nm_2, 2)
+        nl, batch_size, img_size = len(p), p[0].shape[0], imgs[0].shape[1]
+        targets = targets.view(-1, 6)  # (bs, gt_max, 6) -> (bs*gt_max, 6)
+        mask_t = targets[:, 1] >= 0  # (bs*gt_max,)
+        targets = ops.masked_select(targets, ops.tile(mask_t[:, None], (1, 6))).view(-1, 6)  # (nt, 6)
+
+        matching_bs = ()
+        matching_as = ()
+        matching_gjs = ()
+        matching_gis = ()
+        matching_targets = ()
+        matching_anchs = ()
+        matching_from_which_layers = ()
+
+        for batch_idx in range(p[0].shape[0]):
+            b_idx = (targets[:, 0] == batch_idx) # (n_tb,)
+            # this_target = ops.masked_select(targets, ops.tile(b_idx[:, None], (1, 6))).view(-1, 6) # (n_tb, 6)
+            this_target = ops.masked_select(targets, ops.broadcast_to(b_idx[:, None], b_idx.shape + (6,))).view(-1, 6)  # (n_tb, 6)
+            if this_target.shape[0] == 0:
+                continue
+
+            txywh = this_target[:, 2:6] * imgs[batch_idx].shape[1] # (n_tb, 4)
+            txyxy = self.xywh2xyxy(txywh)
+            pxyxys = ()
+            p_cls = ()
+            p_obj = ()
+            from_which_layer = ()
+            all_b = ()
+            all_a = ()
+            all_gj = ()
+            all_gi = ()
+            all_anch = ()
+
+            for i, pi in enumerate(p):
+                # b, a, gj, gi = indices[i]
+                # b, a, gj, gi = ops.split(indices[i], 0, 4) # ms 1.8.1
+                b, a, gj, gi = ops.split(indices[i], 1, 0)  # ms 2.0.0
+                b, a, gj, gi = b.view(-1), a.view(-1), gj.view(-1), gi.view(-1)
+
+                idx = (b == batch_idx) # (n_tp_b,)
+                b, a, gj, gi = ops.masked_select(b, idx), ops.masked_select(a, idx), \
+                               ops.masked_select(gj, idx), ops.masked_select(gi, idx)
+                # _this_anch = ops.masked_select(anch[i], ops.tile(idx[:, None], (1, 2))).view(-1, 2) # (n_tp_b, 2)
+                _this_anch = ops.masked_select(anch[i], ops.broadcast_to(idx[:, None], idx.shape + (2,))).view(-1, 2)  # (n_tp_b, 2)
+                all_b += (b,)
+                all_a += (a,)
+                all_gj += (gj,)
+                all_gi += (gi,)
+                all_anch += (_this_anch,)
+                from_which_layer += (ops.ones((b.shape[0],), ms.int32) * i,)
+
+                fg_pred = pi[b, a, gj, gi] # (n_tp_b, 85)
+                p_obj += (fg_pred[:, 4:5],)
+                p_cls += (fg_pred[:, 5:],)
+
+                grid = ops.stack((gi, gj), axis=1) # (n_tp_b, 2)
+                pxy = (ops.Sigmoid()(fg_pred[:, :2]) * 2. - 0.5 + grid) * self.stride[i]  # / 8.
+                pwh = (ops.Sigmoid()(fg_pred[:, 2:4]) * 2) ** 2 * _this_anch * self.stride[i]  # / 8.
+                pxywh = ops.concat((pxy, pwh), axis=-1) # (n_tp_b, 4)
+                pxyxy = self.xywh2xyxy(pxywh)
+                pxyxys += (pxyxy,)
+
+            pxyxys = ops.concat(pxyxys, axis=0) # (n_tp, 4)
+            if pxyxys.shape[0] == 0:
+                continue
+            p_obj = ops.concat(p_obj, axis=0) # (n_tp, 1)
+            p_cls = ops.concat(p_cls, axis=0) # (n_tp, 80)
+            from_which_layer = ops.concat(from_which_layer, axis=0)
+            all_b = ops.concat(all_b, axis=0) # (n_tp,)
+            all_a = ops.concat(all_a, axis=0)
+            all_gj = ops.concat(all_gj, axis=0)
+            all_gi = ops.concat(all_gi, axis=0)
+            all_anch = ops.concat(all_anch, axis=0) # (n_tp, 2)
+
+            pair_wise_iou = box_iou(txyxy, pxyxys) # (n_tb, 4), (n_tp, 4) -> (n_tb, n_tp)
+            pair_wise_iou_loss = -ops.log(pair_wise_iou + 1e-8)
+
+            v, _ = ops.top_k(pair_wise_iou, min(10, pair_wise_iou.shape[1])) # (n_tb, 10)
+            dynamic_ks = v.sum(1).astype(ms.int32).clip(1, None) # (n_tb,)
+
+            gt_cls_per_image = ops.one_hot(indices=ops.cast(this_target[:, 1], ms.int32),
+                                           depth=self.nc,
+                                           on_value=ops.ones(1, pair_wise_iou.dtype),
+                                           off_value=ops.zeros(1, pair_wise_iou.dtype)) # (n_tb, 80)
+            # gt_cls_per_image = ops.tile(gt_cls_per_image[:, None, :], (1, pxyxys.shape[0], 1)) # (n_tb, n_tp, 85)
+            gt_cls_per_image = ops.broadcast_to(gt_cls_per_image[:, None, :], (gt_cls_per_image.shape[0], pxyxys.shape[0], gt_cls_per_image.shape[1]))  # (n_tb, n_tp, 85)
+
+            num_gt = this_target.shape[0]
+            # cls_preds_ = ops.Sigmoid()(ops.tile(p_cls[None, :, :], (num_gt, 1, 1))) * \
+            #              ops.Sigmoid()(ops.tile(p_obj[None, :, :], (num_gt, 1, 1))) # (n_tb, n_tp, 80)
+            cls_preds_ = ops.Sigmoid()(ops.broadcast_to(p_cls[None, :, :], (num_gt,) + p_cls.shape)) * \
+                         ops.Sigmoid()(ops.broadcast_to(p_obj[None, :, :], (num_gt,) + p_obj.shape))  # (n_tb, n_tp, 80)
+
+            y = ops.sqrt(cls_preds_)
+            pair_wise_cls_loss = ops.binary_cross_entropy_with_logits(
+                ops.log(y / (1 - y)),
+                gt_cls_per_image,
+                ops.ones(1, cls_preds_.dtype),
+                ops.ones(1, cls_preds_.dtype),
+                reduction="none",
+            ).sum(-1)
+
+            cost = pair_wise_cls_loss + 3.0 * pair_wise_iou_loss  # (n_tb, n_tp)
+
+            # 1. dynamic-k match with pynative and dynamic-shape
+            matching_matrix = ops.zeros_like(cost)
+            for gt_idx in range(num_gt):
+                _, pos_idx = ops.top_k(
+                    cost[gt_idx], k=int(dynamic_ks[gt_idx].asnumpy())
+                )
+                matching_matrix[gt_idx][pos_idx] = 1.0
+
+            # 2. dynamic-k match with pynative and static-shape
+            # sort_cost, sort_idx = ops.top_k(-cost, 10, sorted=True)
+            # sort_cost = -sort_cost
+            # pos_idx = ops.stack((mnp.arange(cost.shape[0]), dynamic_ks - 1), -1)
+            # pos_v = ops.gather_nd(sort_cost, pos_idx)
+            # matching_matrix = ops.cast(cost <= pos_v[:, None], ms.int32)
+
+            anchor_matching_gt = matching_matrix.sum(0)  # (n_tp,)
+            anchor_matching_mask = anchor_matching_gt > 1  # (n_tp,)
+            anchor_matching_mask_idx = ops.masked_select(mnp.arange(cost.shape[1]), anchor_matching_mask)
+            if anchor_matching_mask.astype(cost.dtype).sum() > 0:
+                # cost_argmin = ops.argmin(ops.masked_select(cost,
+                #                                            ops.tile(anchor_matching_mask[None, :], (cost.shape[0], 1))
+                #                                            ).view(cost.shape[0], -1), axis=0)
+                cost_argmin = ops.argmin(ops.masked_select(cost,
+                                                           ops.broadcast_to(anchor_matching_mask[None, :], (cost.shape[0],) + anchor_matching_mask.shape)
+                                                           ).view(cost.shape[0], -1), axis=0)
+                # matching_matrix[:, anchor_matching_mask_idx] *= 0.0
+                matching_matrix *= 1 - anchor_matching_mask.astype(matching_matrix.dtype)
+                matching_matrix[cost_argmin, anchor_matching_mask_idx] = 1.0
+            fg_mask_inboxes = matching_matrix.sum(0) > 0.0 # (n_tp,)
+
+            if fg_mask_inboxes.astype(cost.dtype).sum() > 0.0:
+                fg_mask_inboxes_idx = ops.masked_select(mnp.arange(cost.shape[1]), fg_mask_inboxes) # (n_tp_m,)
+
+                # matched_gt_inds = matching_matrix[:, fg_mask_inboxes_idx].argmax(0) # (n_tb, n_tp) -> (n_tb, n_tp_m,) -> (n_tp_m,)
+                matched_gt_inds = matching_matrix.transpose(1, 0)[fg_mask_inboxes_idx].argmax(1) # (n_tb, n_tp) -> (n_tp, n_tb) -> (n_tp_m, n_tb) -> (n_tp_m,)
+
+                from_which_layer = from_which_layer[fg_mask_inboxes_idx] # (n_tp,) -> (n_tp_m,)
+                all_b = all_b[fg_mask_inboxes_idx]
+                all_a = all_a[fg_mask_inboxes_idx]
+                all_gj = all_gj[fg_mask_inboxes_idx]
+                all_gi = all_gi[fg_mask_inboxes_idx]
+                all_anch = all_anch[fg_mask_inboxes_idx]
+
+                this_target = this_target[matched_gt_inds] # (n_tb, 6) -> (n_tp_m, 6)
+
+                matching_from_which_layers += (from_which_layer,)
+                matching_bs += (all_b,)
+                matching_as += (all_a,)
+                matching_gjs += (all_gj,)
+                matching_gis += (all_gi,)
+                matching_targets += (this_target,)
+                matching_anchs += (all_anch,)
+
+        matching_bs = ops.concat(matching_bs, 0)
+        matching_as = ops.concat(matching_as, 0)
+        matching_gjs = ops.concat(matching_gjs, 0)
+        matching_gis = ops.concat(matching_gis, 0)
+        matching_targets = ops.concat(matching_targets, 0)
+        matching_anchs = ops.concat(matching_anchs, 0)
+        matching_from_which_layers = ops.concat(matching_from_which_layers, 0)
+
+        _matching_bs = ()
+        _matching_as = ()
+        _matching_gjs = ()
+        _matching_gis = ()
+        _matching_targets = ()
+        _matching_anchs = ()
+        _matching_from_which_layers = ()
+
+        for i in range(nl):
+            layer_mask = matching_from_which_layers == i
+            if layer_mask.astype(ms.float16).sum() > 0.0:
+                layer_idx = ops.masked_select(mnp.arange(matching_bs.shape[0]), layer_mask)
+                _matching_bs += (ops.stop_gradient(matching_bs[layer_idx]),)
+                _matching_as += (ops.stop_gradient(matching_as[layer_idx]),)
+                _matching_gjs += (ops.stop_gradient(matching_gjs[layer_idx]),)
+                _matching_gis += (ops.stop_gradient(matching_gis[layer_idx]),)
+                _matching_targets += (ops.stop_gradient(matching_targets[layer_idx]),)
+                _matching_anchs += (ops.stop_gradient(matching_anchs[layer_idx]),)
+            else:
+                _matching_bs += (Tensor([], matching_bs.dtype),)
+                _matching_as += (Tensor([], matching_as.dtype),)
+                _matching_gjs += (Tensor([], matching_gjs.dtype),)
+                _matching_gis += (Tensor([], matching_gis.dtype),)
+                _matching_targets += (Tensor([], matching_targets.dtype),)
+                _matching_anchs += (Tensor([], matching_anchs.dtype),)
+
+        return _matching_bs, _matching_as, _matching_gjs, _matching_gis, _matching_targets, _matching_anchs
+
+    def xywh2xyxy(self, x):
+        # Convert nx4 boxes from [x, y, w, h] to [x1, y1, x2, y2] where xy1=top-left, xy2=bottom-right
+        y = ops.zeros(x.shape, x.dtype)
+        y[:, 0] = x[:, 0] - x[:, 2] / 2  # top left x
+        y[:, 1] = x[:, 1] - x[:, 3] / 2  # top left y
+        y[:, 2] = x[:, 0] + x[:, 2] / 2  # bottom right x
+        y[:, 3] = x[:, 1] + x[:, 3] / 2  # bottom right y
+        return y
+
+    def find_3_positive(self, p, targets):
+        # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
+        targets = targets.view(-1, 6) # (bs, gt_max, 6) -> (bs*gt_max, 6)
+        mask_t = targets[:, 1] >= 0 # (bs*gt_max,)
+
+        # targets = ops.masked_select(targets, ops.tile(mask_t[:, None], (1, 6))).view(-1, 6) # (nt, 6)
+        targets = ops.masked_select(targets, ops.broadcast_to(mask_t[:, None], mask_t.shape + (6,))).view(-1, 6)  # (nt, 6)
+
+        na, nt = self.na, targets.shape[0]  # number of anchors, targets
+        indices, anch, tmasks = (), (), ()
+        gain = ops.ones(7, ms.int32)  # normalized to gridspace gain
+
+        # ai = ops.tile(mnp.arange(na, dtype=targets.dtype).view(na, 1), (1, nt)) # shape: (na, nt)
+        ai = ops.broadcast_to(mnp.arange(na, dtype=targets.dtype).view(na, 1), (na, nt))
+
+        # (na, nt, 7)
+        # targets = ops.concat((ops.tile(targets[None, :, :], (na, 1, 1)), ai[:, :, None]), 2)  # append anchor indices # not support dynamic shape
+        targets = ops.concat((ops.broadcast_to(targets[None, :, :], (na,) + targets.shape[:]), ai[:, :, None]), 2) # append anchor indices
+
+        g = 0.5  # bias
+        off = ops.cast(self._off, targets.dtype) * g  # offsets
+
+        for i in range(self.nl):
+            anchors, shape = self.anchors[i], p[i].shape
+            gain[2:6] = get_tensor(shape, targets.dtype)[[3, 2, 3, 2]]  # xyxy gain # [W, H, W, H]
+
+            # Match targets to anchors
+            t = targets * gain # (na, nt, 7)
+            # Matches
+            if nt:
+                r = t[:, :, 4:6] / anchors[:, None, :]  # wh ratio # (na, nt, 2)
+                j = ops.maximum(r, 1. / r).max(2) < self.hyp_anchor_t  # compare # (na, nt)
+
+                # t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7) # (nm, 7)
+                t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm, 7)
+
+                # t = t[j]  # filter
+
+                # Offsets
+                gxy = t[:, 2:4]  # grid xy # (nm, 2)
+                gxi = gain[[2, 3]] - gxy  # inverse
+                jk = ops.logical_and((gxy % 1 < g), (gxy > 1))
+                lm = ops.logical_and((gxi % 1 < g), (gxi > 1))
+                j, k = jk[:, 0], jk[:, 1] # (nm,)
+                l, m = lm[:, 0], lm[:, 1]
+
+                # original
+                j = ops.stack((ops.ones_like(j), j, k, l, m))  # shape: (5, nm)
+
+                # t = ops.tile(t, (5, 1, 1))  # shape(5, nm, 7)
+                # t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7)  # (nm_2, 7)
+                t = ops.broadcast_to(t, (5,) + t.shape)
+                t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm_2, 7)
+
+                offsets = ops.zeros_like(gxy)[None, :, :] + off[:, None, :] # (5, nm, 2)
+                # offsets = ops.masked_select(offsets, ops.tile(j[:, :, None], (1, 1, 2))).view(-1, 2)
+                offsets = ops.masked_select(offsets, ops.broadcast_to(j[:, :, None], j.shape + (2,))).view(-1, 2)
+            else:
+                t = targets[0]
+                offsets = 0
+                print("warning: find_3_pos: this batch has no target!")
+
+            # Define # (nm_2,)
+            b, c, gxy, gwh, a = ops.cast(t[:, 0], ms.int32), \
+                                ops.cast(t[:, 1], ms.int32), \
+                                t[:, 2:4], \
+                                t[:, 4:6], \
+                                ops.cast(t[:, 6], ms.int32)  # (image, class), grid xy, grid wh, anchors # b: (5*na*nt,), gxy: (5*na*nt, 2)
+            gij = ops.cast(gxy - offsets, ms.int32)
+            gi, gj = gij[:, 0], gij[:, 1]  # grid indices
+            gi = gi.clip(0, shape[3] - 1)
+            gj = gj.clip(0, shape[2] - 1)
+
+            # Append
+            indices += (ops.stack((b, a, gj, gi), 0),)  # image, anchor, grid
+            anch += (anchors[a],)  # anchors
+
+        return indices, anch
+
+class ComputeLossAuxOTA_dynamic(nn.Cell):
+    # run with mindspore version 2.0.0
+    def __init__(self, model, autobalance=False):
+        super(ComputeLossOTA_dynamic, self).__init__()
+        h = model.opt
+        self.hyp_box = h.box
+        self.hyp_obj = h.obj
+        self.hyp_cls = h.cls
+        self.hyp_anchor_t = h.anchor_t
+
+        # Class label smoothing https://arxiv.org/pdf/1902.04103.pdf eqn 3
+        self.cp, self.cn = smooth_BCE(eps=h.label_smoothing)  # positive, negative BCE targets
+        # Focal loss
+        g = h.fl_gamma  # focal loss gamma
+        if g > 0:
+            BCEcls, BCEobj = FocalLoss(bce_pos_weight=Tensor([h.cls_pw], ms.float32), gamma=g), \
+                             FocalLoss(bce_pos_weight=Tensor([h.obj_pw], ms.float32), gamma=g)
+        else:
+            # Define criteria
+            BCEcls = BCEWithLogitsLoss(bce_pos_weight=Tensor(np.array([h.cls_pw]), ms.float32))
+            BCEobj = BCEWithLogitsLoss(bce_pos_weight=Tensor(np.array([h.obj_pw]), ms.float32))
+
+        m = model.model[-1]  # Detect() module
+        _balance = {3: [4.0, 1.0, 0.4]}.get(m.nl, [4.0, 1.0, 0.25, 0.06, 0.02])  # P3-P7
+        self.balance = ms.Parameter(Tensor(_balance, ms.float32), requires_grad=False)
+        self.ssi = list(m.stride).index(16) if autobalance else 0  # stride 16 index
+        self.BCEcls, self.BCEobj, self.gr, self.autobalance = BCEcls, BCEobj, 1.0, autobalance
+
+        self.na = m.na  # number of anchors
+        self.nc = m.nc  # number of classes
+        self.nl = m.nl  # number of layers
+        self.anchors = m.anchors
+        self.stride = m.stride
+
+        self._off = Tensor([
+            [0, 0],
+            [1, 0],
+            [0, 1],
+            [-1, 0],
+            [0, -1],  # j,k,l,m
+            # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
+        ], dtype=ms.float32)
+
+    def construct(self, p, targets, imgs):
+        lcls, lbox, lobj = 0., 0., 0.
+        bs, as_, gjs, gis, targets, anchors = self.build_targets(p[:self.nl], targets, imgs) # bs: (nl, bs*5*na*gt_max)
+        bs_aux, as_aux_, gjs_aux, gis_aux, targets_aux, anchors_aux = self.build_targets2(p[:self.nl], targets, imgs)
+
+        bs, as_, gjs, gis, targets, anchors = ops.stop_gradient(bs), ops.stop_gradient(as_), \
+                                              ops.stop_gradient(gjs), ops.stop_gradient(gis), \
+                                              ops.stop_gradient(targets), ops.stop_gradient(anchors)
+        bs_aux, as_aux_, gjs_aux, gis_aux, targets_aux, anchors_aux = ops.stop_gradient(bs_aux),\
+                                                                      ops.stop_gradient(as_aux_), \
+                                                                      ops.stop_gradient(gjs_aux), \
+                                                                      ops.stop_gradient(gis_aux), \
+                                                                      ops.stop_gradient(targets_aux), \
+                                                                      ops.stop_gradient(anchors_aux)
+        pre_gen_gains = ()
+        pre_gen_gains_aux = ()
+        for pp in p[:self.nl]:
+            pre_gen_gains += (get_tensor(pp.shape, pp.dtype)[[3, 2, 3, 2]],)
+            pre_gen_gains_aux += (get_tensor(pp.shape, pp.dtype)[[3, 2, 3, 2]],)
+
+        # Losses
+        for i in range(self.nl):  # layer index, layer predictions
+            pi = p[i]
+            pi_aux = p[i + self.nl]
+            b, a, gj, gi = bs[i], as_[i], gjs[i], gis[i]  # image, anchor, gridy, gridx, tmask
+            b_aux, a_aux, gj_aux, gi_aux = bs_aux[i], as_aux_[i], gjs_aux[i], gis_aux[i]
+            tobj = ops.zeros_like(pi[..., 0])  # target obj
+            tobj_aux = ops.zeros_like(pi_aux[..., 0])
+
+            # 1. Branch Common
+            n = b.shape[0]  # number of targets
+            ps = pi[b, a, gj, gi]  # prediction subset corresponding to targets
+            # Regression
+            grid = ops.stack([gi, gj], axis=1)
+            pxy = ops.Sigmoid()(ps[:, :2]) * 2. - 0.5
+            pwh = (ops.Sigmoid()(ps[:, 2:4]) * 2) ** 2 * anchors[i]
+            pbox = ops.concat((pxy, pwh), 1)  # predicted box
+            selected_tbox = targets[i][:, 2:6] * pre_gen_gains[i]
+            # selected_tbox[:, 0:2] -= grid
+            # _selected_tbox_1, _selected_tbox_2 = ops.split(selected_tbox, 1, 2) # ms 1.8.1
+            _selected_tbox_1, _selected_tbox_2 = ops.split(selected_tbox, 2, 1) # ms 2.0.0
+            _selected_tbox_1 -= grid
+            selected_tbox = ops.concat((_selected_tbox_1, _selected_tbox_2), 1)
+            iou = bbox_iou_2(pbox, selected_tbox, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
+            lbox += (1.0 - iou).mean() # iou loss
+            # Objectness
+            tobj[b, a, gj, gi] = ops.ones(iou.shape, iou.dtype) * \
+                                 ((1.0 - self.gr) + self.gr * ops.stop_gradient(iou).clip(0, None)) # iou ratio
+            # Classification
+            selected_tcls = ops.cast(targets[i][:, 1], ms.int32)
+            if self.nc > 1:  # cls loss (only if multiple classes)
+                t = ops.ones_like(ps[:, 5:]) * self.cn # targets
+                t[mnp.arange(n), selected_tcls.view(n)] = self.cp
+                lcls += self.BCEcls(ps[:, 5:], t)  # BCE
+
+            # 2. Branch Aux
+            n_aux = b_aux.shape[0]  # number of targets
+            ps_aux = pi_aux[b_aux, a_aux, gj_aux, gi_aux]  # prediction subset corresponding to targets
+            # Regression
+            grid_aux = ops.stack([gi_aux, gj_aux], axis=1)
+            pxy_aux = ops.Sigmoid()(ps_aux[:, :2]) * 2. - 0.5
+            pwh_aux = (ops.Sigmoid()(ps_aux[:, 2:4]) * 2) ** 2 * anchors_aux[i]
+            pbox_aux = ops.concat((pxy_aux, pwh_aux), 1)  # predicted box
+            selected_tbox_aux = targets_aux[i][:, 2:6] * pre_gen_gains_aux[i]
+            _selected_tbox_1_aux, _selected_tbox_2_aux = ops.split(selected_tbox_aux, 2, 1)  # ms 2.0.0
+            _selected_tbox_1_aux -= grid_aux
+            selected_tbox_aux = ops.concat((_selected_tbox_1_aux, _selected_tbox_2_aux), 1)
+            iou_aux = bbox_iou_2(pbox_aux, selected_tbox_aux, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
+            lbox += 0.25 * (1.0 - iou_aux).mean()  # iou loss
+            # Objectness
+            tobj_aux[b_aux, a_aux, gj_aux, gi_aux] = ops.ones(iou_aux.shape, iou_aux.dtype) * \
+                                 ((1.0 - self.gr) + self.gr * ops.stop_gradient(iou_aux).clip(0, None))  # iou ratio
+            # Classification
+            selected_tcls_aux = ops.cast(targets_aux[i][:, 1], ms.int32)
+            if self.nc > 1:  # cls loss (only if multiple classes)
+                t_aux = ops.ones_like(ps_aux[:, 5:]) * self.cn  # targets
+                t_aux[mnp.arange(n_aux), selected_tcls_aux.view(n_aux)] = self.cp
+                lcls += 0.25 * self.BCEcls(ps_aux[:, 5:], t_aux)  # BCE
+
+
+            obji = self.BCEobj(pi[..., 4], tobj)
+            obji_aux = self.BCEobj(pi_aux[..., 4], tobj_aux)
+            lobj += obji * self.balance[i] + 0.25 * obji_aux * self.balance[i] # obj loss
+            if self.autobalance:
+                self.balance[i] = self.balance[i] * 0.9999 + 0.0001 / ops.stop_gradient(obji)
+
+        if self.autobalance:
+            _balance_ssi = self.balance[self.ssi]
+            self.balance /= _balance_ssi
+        lbox *= self.hyp_box
+        lobj *= self.hyp_obj
+        lcls *= self.hyp_cls
+        bs = p[0].shape[0]  # batch size
+
+        loss = lbox + lobj + lcls
+        return loss * bs, ops.stop_gradient(ops.stack((lbox, lobj, lcls, loss)))
+
+    def build_targets(self, p, targets, imgs):
+        indices, anch = self.find_3_positive(p, targets) # 3 * (4, nm_2), 3 * (nm_2, 2)
+        nl, batch_size, img_size = len(p), p[0].shape[0], imgs[0].shape[1]
+        targets = targets.view(-1, 6)  # (bs, gt_max, 6) -> (bs*gt_max, 6)
+        mask_t = targets[:, 1] >= 0  # (bs*gt_max,)
+        targets = ops.masked_select(targets, ops.tile(mask_t[:, None], (1, 6))).view(-1, 6)  # (nt, 6)
+
+        matching_bs = ()
+        matching_as = ()
+        matching_gjs = ()
+        matching_gis = ()
+        matching_targets = ()
+        matching_anchs = ()
+        matching_from_which_layers = ()
+
+        for batch_idx in range(p[0].shape[0]):
+            b_idx = (targets[:, 0] == batch_idx) # (n_tb,)
+            # this_target = ops.masked_select(targets, ops.tile(b_idx[:, None], (1, 6))).view(-1, 6) # (n_tb, 6)
+            this_target = ops.masked_select(targets, ops.broadcast_to(b_idx[:, None], b_idx.shape + (6,))).view(-1, 6)  # (n_tb, 6)
+            if this_target.shape[0] == 0:
+                continue
+
+            txywh = this_target[:, 2:6] * imgs[batch_idx].shape[1] # (n_tb, 4)
+            txyxy = self.xywh2xyxy(txywh)
+            pxyxys = ()
+            p_cls = ()
+            p_obj = ()
+            from_which_layer = ()
+            all_b = ()
+            all_a = ()
+            all_gj = ()
+            all_gi = ()
+            all_anch = ()
+
+            for i, pi in enumerate(p):
+                # b, a, gj, gi = indices[i]
+                # b, a, gj, gi = ops.split(indices[i], 0, 4) # ms 1.8.1
+                b, a, gj, gi = ops.split(indices[i], 1, 0)  # ms 2.0.0
+                b, a, gj, gi = b.view(-1), a.view(-1), gj.view(-1), gi.view(-1)
+
+                idx = (b == batch_idx) # (n_tp_b,)
+                b, a, gj, gi = ops.masked_select(b, idx), ops.masked_select(a, idx), \
+                               ops.masked_select(gj, idx), ops.masked_select(gi, idx)
+                # _this_anch = ops.masked_select(anch[i], ops.tile(idx[:, None], (1, 2))).view(-1, 2) # (n_tp_b, 2)
+                _this_anch = ops.masked_select(anch[i], ops.broadcast_to(idx[:, None], idx.shape + (2,))).view(-1, 2)  # (n_tp_b, 2)
+                all_b += (b,)
+                all_a += (a,)
+                all_gj += (gj,)
+                all_gi += (gi,)
+                all_anch += (_this_anch,)
+                from_which_layer += (ops.ones((b.shape[0],), ms.int32) * i,)
+
+                fg_pred = pi[b, a, gj, gi] # (n_tp_b, 85)
+                p_obj += (fg_pred[:, 4:5],)
+                p_cls += (fg_pred[:, 5:],)
+
+                grid = ops.stack((gi, gj), axis=1) # (n_tp_b, 2)
+                pxy = (ops.Sigmoid()(fg_pred[:, :2]) * 2. - 0.5 + grid) * self.stride[i]  # / 8.
+                pwh = (ops.Sigmoid()(fg_pred[:, 2:4]) * 2) ** 2 * _this_anch * self.stride[i]  # / 8.
+                pxywh = ops.concat((pxy, pwh), axis=-1) # (n_tp_b, 4)
+                pxyxy = self.xywh2xyxy(pxywh)
+                pxyxys += (pxyxy,)
+
+            pxyxys = ops.concat(pxyxys, axis=0) # (n_tp, 4)
+            if pxyxys.shape[0] == 0:
+                continue
+            p_obj = ops.concat(p_obj, axis=0) # (n_tp, 1)
+            p_cls = ops.concat(p_cls, axis=0) # (n_tp, 80)
+            from_which_layer = ops.concat(from_which_layer, axis=0)
+            all_b = ops.concat(all_b, axis=0) # (n_tp,)
+            all_a = ops.concat(all_a, axis=0)
+            all_gj = ops.concat(all_gj, axis=0)
+            all_gi = ops.concat(all_gi, axis=0)
+            all_anch = ops.concat(all_anch, axis=0) # (n_tp, 2)
+
+            pair_wise_iou = box_iou(txyxy, pxyxys) # (n_tb, 4), (n_tp, 4) -> (n_tb, n_tp)
+            pair_wise_iou_loss = -ops.log(pair_wise_iou + 1e-8)
+
+            v, _ = ops.top_k(pair_wise_iou, min(20, pair_wise_iou.shape[1])) # (n_tb, 10)
+            dynamic_ks = v.sum(1).astype(ms.int32).clip(1, None) # (n_tb,)
+
+            gt_cls_per_image = ops.one_hot(indices=ops.cast(this_target[:, 1], ms.int32),
+                                           depth=self.nc,
+                                           on_value=ops.ones(1, pair_wise_iou.dtype),
+                                           off_value=ops.zeros(1, pair_wise_iou.dtype)) # (n_tb, 80)
+            # gt_cls_per_image = ops.tile(gt_cls_per_image[:, None, :], (1, pxyxys.shape[0], 1)) # (n_tb, n_tp, 85)
+            gt_cls_per_image = ops.broadcast_to(gt_cls_per_image[:, None, :], (gt_cls_per_image.shape[0], pxyxys.shape[0], gt_cls_per_image.shape[1]))  # (n_tb, n_tp, 85)
+
+            num_gt = this_target.shape[0]
+            # cls_preds_ = ops.Sigmoid()(ops.tile(p_cls[None, :, :], (num_gt, 1, 1))) * \
+            #              ops.Sigmoid()(ops.tile(p_obj[None, :, :], (num_gt, 1, 1))) # (n_tb, n_tp, 80)
+            cls_preds_ = ops.Sigmoid()(ops.broadcast_to(p_cls[None, :, :], (num_gt,) + p_cls.shape)) * \
+                         ops.Sigmoid()(ops.broadcast_to(p_obj[None, :, :], (num_gt,) + p_obj.shape))  # (n_tb, n_tp, 80)
+
+            y = ops.sqrt(cls_preds_)
+            pair_wise_cls_loss = ops.binary_cross_entropy_with_logits(
+                ops.log(y / (1 - y)),
+                gt_cls_per_image,
+                ops.ones(1, cls_preds_.dtype),
+                ops.ones(1, cls_preds_.dtype),
+                reduction="none",
+            ).sum(-1)
+
+            cost = pair_wise_cls_loss + 3.0 * pair_wise_iou_loss  # (n_tb, n_tp)
+
+            # 1. dynamic-k match with pynative and dynamic-shape
+            matching_matrix = ops.zeros_like(cost)
+            for gt_idx in range(num_gt):
+                _, pos_idx = ops.top_k(
+                    cost[gt_idx], k=int(dynamic_ks[gt_idx].asnumpy())
+                )
+                matching_matrix[gt_idx][pos_idx] = 1.0
+
+            # 2. dynamic-k match with pynative and static-shape
+            # sort_cost, sort_idx = ops.top_k(-cost, 10, sorted=True)
+            # sort_cost = -sort_cost
+            # pos_idx = ops.stack((mnp.arange(cost.shape[0]), dynamic_ks - 1), -1)
+            # pos_v = ops.gather_nd(sort_cost, pos_idx)
+            # matching_matrix = ops.cast(cost <= pos_v[:, None], ms.int32)
+
+            anchor_matching_gt = matching_matrix.sum(0)  # (n_tp,)
+            anchor_matching_mask = anchor_matching_gt > 1  # (n_tp,)
+            anchor_matching_mask_idx = ops.masked_select(mnp.arange(cost.shape[1]), anchor_matching_mask)
+            if anchor_matching_mask.astype(cost.dtype).sum() > 0:
+                # cost_argmin = ops.argmin(ops.masked_select(cost,
+                #                                            ops.tile(anchor_matching_mask[None, :], (cost.shape[0], 1))
+                #                                            ).view(cost.shape[0], -1), axis=0)
+                cost_argmin = ops.argmin(ops.masked_select(cost,
+                                                           ops.broadcast_to(anchor_matching_mask[None, :], (cost.shape[0],) + anchor_matching_mask.shape)
+                                                           ).view(cost.shape[0], -1), axis=0)
+                # matching_matrix[:, anchor_matching_mask_idx] *= 0.0
+                matching_matrix *= 1 - anchor_matching_mask.astype(matching_matrix.dtype)
+                matching_matrix[cost_argmin, anchor_matching_mask_idx] = 1.0
+            fg_mask_inboxes = matching_matrix.sum(0) > 0.0 # (n_tp,)
+
+            if fg_mask_inboxes.astype(cost.dtype).sum() > 0.0:
+                fg_mask_inboxes_idx = ops.masked_select(mnp.arange(cost.shape[1]), fg_mask_inboxes) # (n_tp_m,)
+
+                # matched_gt_inds = matching_matrix[:, fg_mask_inboxes_idx].argmax(0) # (n_tb, n_tp) -> (n_tb, n_tp_m,) -> (n_tp_m,)
+                matched_gt_inds = matching_matrix.transpose(1, 0)[fg_mask_inboxes_idx].argmax(1) # (n_tb, n_tp) -> (n_tp, n_tb) -> (n_tp_m, n_tb) -> (n_tp_m,)
+
+                from_which_layer = from_which_layer[fg_mask_inboxes_idx] # (n_tp,) -> (n_tp_m,)
+                all_b = all_b[fg_mask_inboxes_idx]
+                all_a = all_a[fg_mask_inboxes_idx]
+                all_gj = all_gj[fg_mask_inboxes_idx]
+                all_gi = all_gi[fg_mask_inboxes_idx]
+                all_anch = all_anch[fg_mask_inboxes_idx]
+
+                this_target = this_target[matched_gt_inds] # (n_tb, 6) -> (n_tp_m, 6)
+
+                matching_from_which_layers += (from_which_layer,)
+                matching_bs += (all_b,)
+                matching_as += (all_a,)
+                matching_gjs += (all_gj,)
+                matching_gis += (all_gi,)
+                matching_targets += (this_target,)
+                matching_anchs += (all_anch,)
+
+        matching_bs = ops.concat(matching_bs, 0)
+        matching_as = ops.concat(matching_as, 0)
+        matching_gjs = ops.concat(matching_gjs, 0)
+        matching_gis = ops.concat(matching_gis, 0)
+        matching_targets = ops.concat(matching_targets, 0)
+        matching_anchs = ops.concat(matching_anchs, 0)
+        matching_from_which_layers = ops.concat(matching_from_which_layers, 0)
+
+        _matching_bs = ()
+        _matching_as = ()
+        _matching_gjs = ()
+        _matching_gis = ()
+        _matching_targets = ()
+        _matching_anchs = ()
+        _matching_from_which_layers = ()
+
+        for i in range(nl):
+            layer_mask = matching_from_which_layers == i
+            if layer_mask.astype(ms.float16).sum() > 0.0:
+                layer_idx = ops.masked_select(mnp.arange(matching_bs.shape[0]), layer_mask)
+                _matching_bs += (ops.stop_gradient(matching_bs[layer_idx]),)
+                _matching_as += (ops.stop_gradient(matching_as[layer_idx]),)
+                _matching_gjs += (ops.stop_gradient(matching_gjs[layer_idx]),)
+                _matching_gis += (ops.stop_gradient(matching_gis[layer_idx]),)
+                _matching_targets += (ops.stop_gradient(matching_targets[layer_idx]),)
+                _matching_anchs += (ops.stop_gradient(matching_anchs[layer_idx]),)
+            else:
+                _matching_bs += (Tensor([], matching_bs.dtype),)
+                _matching_as += (Tensor([], matching_as.dtype),)
+                _matching_gjs += (Tensor([], matching_gjs.dtype),)
+                _matching_gis += (Tensor([], matching_gis.dtype),)
+                _matching_targets += (Tensor([], matching_targets.dtype),)
+                _matching_anchs += (Tensor([], matching_anchs.dtype),)
+
+        return _matching_bs, _matching_as, _matching_gjs, _matching_gis, _matching_targets, _matching_anchs
+
+    def build_targets2(self, p, targets, imgs):
+        indices, anch = self.find_5_positive(p, targets) # 3 * (4, nm_2), 3 * (nm_2, 2)
+        nl, batch_size, img_size = len(p), p[0].shape[0], imgs[0].shape[1]
+        targets = targets.view(-1, 6)  # (bs, gt_max, 6) -> (bs*gt_max, 6)
+        mask_t = targets[:, 1] >= 0  # (bs*gt_max,)
+        targets = ops.masked_select(targets, ops.tile(mask_t[:, None], (1, 6))).view(-1, 6)  # (nt, 6)
+
+        matching_bs = ()
+        matching_as = ()
+        matching_gjs = ()
+        matching_gis = ()
+        matching_targets = ()
+        matching_anchs = ()
+        matching_from_which_layers = ()
+
+        for batch_idx in range(p[0].shape[0]):
+            b_idx = (targets[:, 0] == batch_idx) # (n_tb,)
+            # this_target = ops.masked_select(targets, ops.tile(b_idx[:, None], (1, 6))).view(-1, 6) # (n_tb, 6)
+            this_target = ops.masked_select(targets, ops.broadcast_to(b_idx[:, None], b_idx.shape + (6,))).view(-1, 6)  # (n_tb, 6)
+            if this_target.shape[0] == 0:
+                continue
+
+            txywh = this_target[:, 2:6] * imgs[batch_idx].shape[1] # (n_tb, 4)
+            txyxy = self.xywh2xyxy(txywh)
+            pxyxys = ()
+            p_cls = ()
+            p_obj = ()
+            from_which_layer = ()
+            all_b = ()
+            all_a = ()
+            all_gj = ()
+            all_gi = ()
+            all_anch = ()
+
+            for i, pi in enumerate(p):
+                # b, a, gj, gi = indices[i]
+                # b, a, gj, gi = ops.split(indices[i], 0, 4) # ms 1.8.1
+                b, a, gj, gi = ops.split(indices[i], 1, 0)  # ms 2.0.0
+                b, a, gj, gi = b.view(-1), a.view(-1), gj.view(-1), gi.view(-1)
+
+                idx = (b == batch_idx) # (n_tp_b,)
+                b, a, gj, gi = ops.masked_select(b, idx), ops.masked_select(a, idx), \
+                               ops.masked_select(gj, idx), ops.masked_select(gi, idx)
+                # _this_anch = ops.masked_select(anch[i], ops.tile(idx[:, None], (1, 2))).view(-1, 2) # (n_tp_b, 2)
+                _this_anch = ops.masked_select(anch[i], ops.broadcast_to(idx[:, None], idx.shape + (2,))).view(-1, 2)  # (n_tp_b, 2)
+                all_b += (b,)
+                all_a += (a,)
+                all_gj += (gj,)
+                all_gi += (gi,)
+                all_anch += (_this_anch,)
+                from_which_layer += (ops.ones((b.shape[0],), ms.int32) * i,)
+
+                fg_pred = pi[b, a, gj, gi] # (n_tp_b, 85)
+                p_obj += (fg_pred[:, 4:5],)
+                p_cls += (fg_pred[:, 5:],)
+
+                grid = ops.stack((gi, gj), axis=1) # (n_tp_b, 2)
+                pxy = (ops.Sigmoid()(fg_pred[:, :2]) * 2. - 0.5 + grid) * self.stride[i]  # / 8.
+                pwh = (ops.Sigmoid()(fg_pred[:, 2:4]) * 2) ** 2 * _this_anch * self.stride[i]  # / 8.
+                pxywh = ops.concat((pxy, pwh), axis=-1) # (n_tp_b, 4)
+                pxyxy = self.xywh2xyxy(pxywh)
+                pxyxys += (pxyxy,)
+
+            pxyxys = ops.concat(pxyxys, axis=0) # (n_tp, 4)
+            if pxyxys.shape[0] == 0:
+                continue
+            p_obj = ops.concat(p_obj, axis=0) # (n_tp, 1)
+            p_cls = ops.concat(p_cls, axis=0) # (n_tp, 80)
+            from_which_layer = ops.concat(from_which_layer, axis=0)
+            all_b = ops.concat(all_b, axis=0) # (n_tp,)
+            all_a = ops.concat(all_a, axis=0)
+            all_gj = ops.concat(all_gj, axis=0)
+            all_gi = ops.concat(all_gi, axis=0)
+            all_anch = ops.concat(all_anch, axis=0) # (n_tp, 2)
+
+            pair_wise_iou = box_iou(txyxy, pxyxys) # (n_tb, 4), (n_tp, 4) -> (n_tb, n_tp)
+            pair_wise_iou_loss = -ops.log(pair_wise_iou + 1e-8)
+
+            v, _ = ops.top_k(pair_wise_iou, min(20, pair_wise_iou.shape[1])) # (n_tb, 10)
+            dynamic_ks = v.sum(1).astype(ms.int32).clip(1, None) # (n_tb,)
+
+            gt_cls_per_image = ops.one_hot(indices=ops.cast(this_target[:, 1], ms.int32),
+                                           depth=self.nc,
+                                           on_value=ops.ones(1, pair_wise_iou.dtype),
+                                           off_value=ops.zeros(1, pair_wise_iou.dtype)) # (n_tb, 80)
+            # gt_cls_per_image = ops.tile(gt_cls_per_image[:, None, :], (1, pxyxys.shape[0], 1)) # (n_tb, n_tp, 85)
+            gt_cls_per_image = ops.broadcast_to(gt_cls_per_image[:, None, :], (gt_cls_per_image.shape[0], pxyxys.shape[0], gt_cls_per_image.shape[1]))  # (n_tb, n_tp, 85)
+
+            num_gt = this_target.shape[0]
+            # cls_preds_ = ops.Sigmoid()(ops.tile(p_cls[None, :, :], (num_gt, 1, 1))) * \
+            #              ops.Sigmoid()(ops.tile(p_obj[None, :, :], (num_gt, 1, 1))) # (n_tb, n_tp, 80)
+            cls_preds_ = ops.Sigmoid()(ops.broadcast_to(p_cls[None, :, :], (num_gt,) + p_cls.shape)) * \
+                         ops.Sigmoid()(ops.broadcast_to(p_obj[None, :, :], (num_gt,) + p_obj.shape))  # (n_tb, n_tp, 80)
+
+            y = ops.sqrt(cls_preds_)
+            pair_wise_cls_loss = ops.binary_cross_entropy_with_logits(
+                ops.log(y / (1 - y)),
+                gt_cls_per_image,
+                ops.ones(1, cls_preds_.dtype),
+                ops.ones(1, cls_preds_.dtype),
+                reduction="none",
+            ).sum(-1)
+
+            cost = pair_wise_cls_loss + 3.0 * pair_wise_iou_loss  # (n_tb, n_tp)
+
+            # 1. dynamic-k match with pynative and dynamic-shape
+            matching_matrix = ops.zeros_like(cost)
+            for gt_idx in range(num_gt):
+                _, pos_idx = ops.top_k(
+                    cost[gt_idx], k=int(dynamic_ks[gt_idx].asnumpy())
+                )
+                matching_matrix[gt_idx][pos_idx] = 1.0
+
+            # 2. dynamic-k match with pynative and static-shape
+            # sort_cost, sort_idx = ops.top_k(-cost, 10, sorted=True)
+            # sort_cost = -sort_cost
+            # pos_idx = ops.stack((mnp.arange(cost.shape[0]), dynamic_ks - 1), -1)
+            # pos_v = ops.gather_nd(sort_cost, pos_idx)
+            # matching_matrix = ops.cast(cost <= pos_v[:, None], ms.int32)
+
+            anchor_matching_gt = matching_matrix.sum(0)  # (n_tp,)
+            anchor_matching_mask = anchor_matching_gt > 1  # (n_tp,)
+            anchor_matching_mask_idx = ops.masked_select(mnp.arange(cost.shape[1]), anchor_matching_mask)
+            if anchor_matching_mask.astype(cost.dtype).sum() > 0:
+                # cost_argmin = ops.argmin(ops.masked_select(cost,
+                #                                            ops.tile(anchor_matching_mask[None, :], (cost.shape[0], 1))
+                #                                            ).view(cost.shape[0], -1), axis=0)
+                cost_argmin = ops.argmin(ops.masked_select(cost,
+                                                           ops.broadcast_to(anchor_matching_mask[None, :], (cost.shape[0],) + anchor_matching_mask.shape)
+                                                           ).view(cost.shape[0], -1), axis=0)
+                # matching_matrix[:, anchor_matching_mask_idx] *= 0.0
+                matching_matrix *= 1 - anchor_matching_mask.astype(matching_matrix.dtype)
+                matching_matrix[cost_argmin, anchor_matching_mask_idx] = 1.0
+            fg_mask_inboxes = matching_matrix.sum(0) > 0.0 # (n_tp,)
+
+            if fg_mask_inboxes.astype(cost.dtype).sum() > 0.0:
+                fg_mask_inboxes_idx = ops.masked_select(mnp.arange(cost.shape[1]), fg_mask_inboxes) # (n_tp_m,)
+
+                # matched_gt_inds = matching_matrix[:, fg_mask_inboxes_idx].argmax(0) # (n_tb, n_tp) -> (n_tb, n_tp_m,) -> (n_tp_m,)
+                matched_gt_inds = matching_matrix.transpose(1, 0)[fg_mask_inboxes_idx].argmax(1) # (n_tb, n_tp) -> (n_tp, n_tb) -> (n_tp_m, n_tb) -> (n_tp_m,)
+
+                from_which_layer = from_which_layer[fg_mask_inboxes_idx] # (n_tp,) -> (n_tp_m,)
+                all_b = all_b[fg_mask_inboxes_idx]
+                all_a = all_a[fg_mask_inboxes_idx]
+                all_gj = all_gj[fg_mask_inboxes_idx]
+                all_gi = all_gi[fg_mask_inboxes_idx]
+                all_anch = all_anch[fg_mask_inboxes_idx]
+
+                this_target = this_target[matched_gt_inds] # (n_tb, 6) -> (n_tp_m, 6)
+
+                matching_from_which_layers += (from_which_layer,)
+                matching_bs += (all_b,)
+                matching_as += (all_a,)
+                matching_gjs += (all_gj,)
+                matching_gis += (all_gi,)
+                matching_targets += (this_target,)
+                matching_anchs += (all_anch,)
+
+        matching_bs = ops.concat(matching_bs, 0)
+        matching_as = ops.concat(matching_as, 0)
+        matching_gjs = ops.concat(matching_gjs, 0)
+        matching_gis = ops.concat(matching_gis, 0)
+        matching_targets = ops.concat(matching_targets, 0)
+        matching_anchs = ops.concat(matching_anchs, 0)
+        matching_from_which_layers = ops.concat(matching_from_which_layers, 0)
+
+        _matching_bs = ()
+        _matching_as = ()
+        _matching_gjs = ()
+        _matching_gis = ()
+        _matching_targets = ()
+        _matching_anchs = ()
+        _matching_from_which_layers = ()
+
+        for i in range(nl):
+            layer_mask = matching_from_which_layers == i
+            if layer_mask.astype(ms.float16).sum() > 0.0:
+                layer_idx = ops.masked_select(mnp.arange(matching_bs.shape[0]), layer_mask)
+                _matching_bs += (ops.stop_gradient(matching_bs[layer_idx]),)
+                _matching_as += (ops.stop_gradient(matching_as[layer_idx]),)
+                _matching_gjs += (ops.stop_gradient(matching_gjs[layer_idx]),)
+                _matching_gis += (ops.stop_gradient(matching_gis[layer_idx]),)
+                _matching_targets += (ops.stop_gradient(matching_targets[layer_idx]),)
+                _matching_anchs += (ops.stop_gradient(matching_anchs[layer_idx]),)
+            else:
+                _matching_bs += (Tensor([], matching_bs.dtype),)
+                _matching_as += (Tensor([], matching_as.dtype),)
+                _matching_gjs += (Tensor([], matching_gjs.dtype),)
+                _matching_gis += (Tensor([], matching_gis.dtype),)
+                _matching_targets += (Tensor([], matching_targets.dtype),)
+                _matching_anchs += (Tensor([], matching_anchs.dtype),)
+
+        return _matching_bs, _matching_as, _matching_gjs, _matching_gis, _matching_targets, _matching_anchs
+
+    def xywh2xyxy(self, x):
+        # Convert nx4 boxes from [x, y, w, h] to [x1, y1, x2, y2] where xy1=top-left, xy2=bottom-right
+        y = ops.zeros(x.shape, x.dtype)
+        y[:, 0] = x[:, 0] - x[:, 2] / 2  # top left x
+        y[:, 1] = x[:, 1] - x[:, 3] / 2  # top left y
+        y[:, 2] = x[:, 0] + x[:, 2] / 2  # bottom right x
+        y[:, 3] = x[:, 1] + x[:, 3] / 2  # bottom right y
+        return y
+
+    def find_3_positive(self, p, targets):
+        # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
+        targets = targets.view(-1, 6) # (bs, gt_max, 6) -> (bs*gt_max, 6)
+        mask_t = targets[:, 1] >= 0 # (bs*gt_max,)
+
+        # targets = ops.masked_select(targets, ops.tile(mask_t[:, None], (1, 6))).view(-1, 6) # (nt, 6)
+        targets = ops.masked_select(targets, ops.broadcast_to(mask_t[:, None], mask_t.shape + (6,))).view(-1, 6)  # (nt, 6)
+
+        na, nt = self.na, targets.shape[0]  # number of anchors, targets
+        indices, anch, tmasks = (), (), ()
+        gain = ops.ones(7, ms.int32)  # normalized to gridspace gain
+
+        # ai = ops.tile(mnp.arange(na, dtype=targets.dtype).view(na, 1), (1, nt)) # shape: (na, nt)
+        ai = ops.broadcast_to(mnp.arange(na, dtype=targets.dtype).view(na, 1), (na, nt))
+
+        # (na, nt, 7)
+        # targets = ops.concat((ops.tile(targets[None, :, :], (na, 1, 1)), ai[:, :, None]), 2)  # append anchor indices # not support dynamic shape
+        targets = ops.concat((ops.broadcast_to(targets[None, :, :], (na,) + targets.shape[:]), ai[:, :, None]), 2) # append anchor indices
+
+        g = 0.5  # bias
+        off = ops.cast(self._off, targets.dtype) * g  # offsets
+
+        for i in range(self.nl):
+            anchors, shape = self.anchors[i], p[i].shape
+            gain[2:6] = get_tensor(shape, targets.dtype)[[3, 2, 3, 2]]  # xyxy gain # [W, H, W, H]
+
+            # Match targets to anchors
+            t = targets * gain # (na, nt, 7)
+            # Matches
+            if nt:
+                r = t[:, :, 4:6] / anchors[:, None, :]  # wh ratio # (na, nt, 2)
+                j = ops.maximum(r, 1. / r).max(2) < self.hyp_anchor_t  # compare # (na, nt)
+
+                # t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7) # (nm, 7)
+                t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm, 7)
+
+                # t = t[j]  # filter
+
+                # Offsets
+                gxy = t[:, 2:4]  # grid xy # (nm, 2)
+                gxi = gain[[2, 3]] - gxy  # inverse
+                jk = ops.logical_and((gxy % 1 < g), (gxy > 1))
+                lm = ops.logical_and((gxi % 1 < g), (gxi > 1))
+                j, k = jk[:, 0], jk[:, 1] # (nm,)
+                l, m = lm[:, 0], lm[:, 1]
+
+                # original
+                j = ops.stack((ops.ones_like(j), j, k, l, m))  # shape: (5, nm)
+
+                # t = ops.tile(t, (5, 1, 1))  # shape(5, nm, 7)
+                # t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7)  # (nm_2, 7)
+                t = ops.broadcast_to(t, (5,) + t.shape)
+                t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm_2, 7)
+
+                offsets = ops.zeros_like(gxy)[None, :, :] + off[:, None, :] # (5, nm, 2)
+                # offsets = ops.masked_select(offsets, ops.tile(j[:, :, None], (1, 1, 2))).view(-1, 2)
+                offsets = ops.masked_select(offsets, ops.broadcast_to(j[:, :, None], j.shape + (2,))).view(-1, 2)
+            else:
+                t = targets[0]
+                offsets = 0
+                print("warning: find_3_pos: this batch has no target!")
+
+            # Define # (nm_2,)
+            b, c, gxy, gwh, a = ops.cast(t[:, 0], ms.int32), \
+                                ops.cast(t[:, 1], ms.int32), \
+                                t[:, 2:4], \
+                                t[:, 4:6], \
+                                ops.cast(t[:, 6], ms.int32)  # (image, class), grid xy, grid wh, anchors # b: (5*na*nt,), gxy: (5*na*nt, 2)
+            gij = ops.cast(gxy - offsets, ms.int32)
+            gi, gj = gij[:, 0], gij[:, 1]  # grid indices
+            gi = gi.clip(0, shape[3] - 1)
+            gj = gj.clip(0, shape[2] - 1)
+
+            # Append
+            indices += (ops.stack((b, a, gj, gi), 0),)  # image, anchor, grid
+            anch += (anchors[a],)  # anchors
+
+        return indices, anch
+
+    def find_5_positive(self, p, targets):
+        # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
+        targets = targets.view(-1, 6) # (bs, gt_max, 6) -> (bs*gt_max, 6)
+        mask_t = targets[:, 1] >= 0 # (bs*gt_max,)
+
+        # targets = ops.masked_select(targets, ops.tile(mask_t[:, None], (1, 6))).view(-1, 6) # (nt, 6)
+        targets = ops.masked_select(targets, ops.broadcast_to(mask_t[:, None], mask_t.shape + (6,))).view(-1, 6)  # (nt, 6)
+
+        na, nt = self.na, targets.shape[0]  # number of anchors, targets
+        indices, anch, tmasks = (), (), ()
+        gain = ops.ones(7, ms.int32)  # normalized to gridspace gain
+
+        # ai = ops.tile(mnp.arange(na, dtype=targets.dtype).view(na, 1), (1, nt)) # shape: (na, nt)
+        ai = ops.broadcast_to(mnp.arange(na, dtype=targets.dtype).view(na, 1), (na, nt))
+
+        # (na, nt, 7)
+        # targets = ops.concat((ops.tile(targets[None, :, :], (na, 1, 1)), ai[:, :, None]), 2)  # append anchor indices # not support dynamic shape
+        targets = ops.concat((ops.broadcast_to(targets[None, :, :], (na,) + targets.shape[:]), ai[:, :, None]), 2) # append anchor indices
+
+        g = 1.0  # bias
+        off = ops.cast(self._off, targets.dtype) * g  # offsets
+
+        for i in range(self.nl):
+            anchors, shape = self.anchors[i], p[i].shape
+            gain[2:6] = get_tensor(shape, targets.dtype)[[3, 2, 3, 2]]  # xyxy gain # [W, H, W, H]
+
+            # Match targets to anchors
+            t = targets * gain # (na, nt, 7)
+            # Matches
+            if nt:
+                r = t[:, :, 4:6] / anchors[:, None, :]  # wh ratio # (na, nt, 2)
+                j = ops.maximum(r, 1. / r).max(2) < self.hyp_anchor_t  # compare # (na, nt)
+
+                # t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7) # (nm, 7)
+                t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm, 7)
+
+                # t = t[j]  # filter
+
+                # Offsets
+                gxy = t[:, 2:4]  # grid xy # (nm, 2)
+                gxi = gain[[2, 3]] - gxy  # inverse
+                jk = ops.logical_and((gxy % 1 < g), (gxy > 1))
+                lm = ops.logical_and((gxi % 1 < g), (gxi > 1))
+                j, k = jk[:, 0], jk[:, 1] # (nm,)
+                l, m = lm[:, 0], lm[:, 1]
+
+                # original
+                j = ops.stack((ops.ones_like(j), j, k, l, m))  # shape: (5, nm)
+
+                # t = ops.tile(t, (5, 1, 1))  # shape(5, nm, 7)
+                # t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7)  # (nm_2, 7)
+                t = ops.broadcast_to(t, (5,) + t.shape)
+                t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm_2, 7)
+
+                offsets = ops.zeros_like(gxy)[None, :, :] + off[:, None, :] # (5, nm, 2)
+                # offsets = ops.masked_select(offsets, ops.tile(j[:, :, None], (1, 1, 2))).view(-1, 2)
+                offsets = ops.masked_select(offsets, ops.broadcast_to(j[:, :, None], j.shape + (2,))).view(-1, 2)
+            else:
+                t = targets[0]
+                offsets = 0
+                print("warning: find_3_pos: this batch has no target!")
+
+            # Define # (nm_2,)
+            b, c, gxy, gwh, a = ops.cast(t[:, 0], ms.int32), \
+                                ops.cast(t[:, 1], ms.int32), \
+                                t[:, 2:4], \
+                                t[:, 4:6], \
+                                ops.cast(t[:, 6], ms.int32)  # (image, class), grid xy, grid wh, anchors # b: (5*na*nt,), gxy: (5*na*nt, 2)
+            gij = ops.cast(gxy - offsets, ms.int32)
+            gi, gj = gij[:, 0], gij[:, 1]  # grid indices
+            gi = gi.clip(0, shape[3] - 1)
+            gj = gj.clip(0, shape[2] - 1)
+
+            # Append
+            indices += (ops.stack((b, a, gj, gi), 0),)  # image, anchor, grid
+            anch += (anchors[a],)  # anchors
+
+        return indices, anch
 
 if __name__ == '__main__':
     from pathlib import Path

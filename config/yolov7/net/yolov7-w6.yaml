@@ -4,8 +4,8 @@ __BASE__: [
 ]
 
 run_eval: False
-recompute: True
-recompute_layers: 5
+recompute: False
+recompute_layers: 0
 batch_size: 128
 
 

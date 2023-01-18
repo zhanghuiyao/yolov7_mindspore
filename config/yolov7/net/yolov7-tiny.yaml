@@ -3,7 +3,7 @@ __BASE__: [
   '../hyp/hyp.scratch.tiny.yaml',
 ]
 
-run_eval: True
+run_eval: False
 recompute: False
 recompute_layers: 0
 batch_size: 128

@@ -4,9 +4,9 @@ __BASE__: [
 ]
 
 run_eval: False
-recompute: True
-recompute_layers: 5
-batch_size: 128
+recompute: False
+recompute_layers: 0
+batch_size: 48
 
 
 nc: 80  # number of classes

@@ -13,7 +13,7 @@ from mindspore.communication.management import init, get_rank, get_group_size
 
 from mindyolo.models.yolo import Model
 from mindyolo.models import EMA
-from mindyolo.models.loss import ComputeLoss, ComputeLossOTA, ComputeLossAuxOTA, ComputeLossOTA_dynamic
+from mindyolo.models.loss import ComputeLoss, ComputeLossOTA, ComputeLossAuxOTA, ComputeLossOTA_dynamic, ComputeLossAuxOTA_dynamic
 from mindyolo.utils.optimizer import get_group_param_yolov7, get_lr_yolov7
 from mindyolo.utils.dataset import create_dataloader
 from mindyolo.utils.general import increment_path, colorstr, check_img_size
@@ -518,9 +518,13 @@ def create_train_dynamic_shape_fn(model, optimizer, loss_scaler, grad_reducer=No
     from mindyolo.utils.all_finite import all_finite
     # Def train func
     # use_ota = opt.loss_ota
-    use_ota = True
+    use_ota = opt.loss_ota
+    use_aux = opt.use_aux
     if use_ota:
-        compute_loss = ComputeLossOTA_dynamic(model)  # init loss class
+        if not use_aux:
+            compute_loss = ComputeLossOTA_dynamic(model)  # init loss class
+        else:
+            compute_loss = ComputeLossAuxOTA_dynamic(model) # init loss class
     else:
         raise NotImplementedError
 
@@ -558,11 +562,11 @@ def create_train_dynamic_shape_fn(model, optimizer, loss_scaler, grad_reducer=No
 
         return loss, loss_items, unscaled_grads, grads_finite
 
-    def forward_warpper(x, label, sizes=None, optimizer_update=True):
-        loss, loss_items = forward_func(x, label, sizes)
-        return loss, loss_items, None, Tensor([True], ms.bool_)
+    # def forward_warpper(x, label, sizes=None, optimizer_update=True):
+    #     loss, loss_items = forward_func(x, label, sizes)
+    #     return loss, loss_items, None, Tensor([True], ms.bool_)
 
-    return forward_warpper
+    return train_step
 
 
 if __name__ == '__main__':

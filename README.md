@@ -98,15 +98,22 @@ other datasets need to use the same format as MS COCO.
 - Run on local
 
   ```text
-  #run training example(1p) by python command
+  #train dynamic-shape p5(tiny/l/x) model example(1p) by python command
   python train.py \
       --config=./config/yolov7/net/yolov7.yaml \
       --device_target="Ascend" \
-      --recompute=True \
-      --recompute_layers=5 \
-      --batch_size=16 \
-      --epochs=300 > log.txt 2>&1 &
+      --ms_mode=1 \
+      --ms_strategy="DynamicShape" \
+      --batch_size=32 > log.txt 2>&1 &
 
+  #train dynamic-shape p6(w6/e6/d6/e6e) model example(1p) by python command
+  python train.py \
+      --config=./config/yolov7/net/yolov7-w6.yaml \
+      --device_target="Ascend" \
+      --ms_mode=1 \
+      --ms_strategy="DynamicShape" \
+      --batch_size=16 > log.txt 2>&1 &
+  
   # standalone training example(1p) by shell script (Training with a single scale)
   bash run_standalone_train_ascend.sh 0
 
@@ -241,10 +248,10 @@ bash run_standalone_train.sh 0
 ```text
 python train.py \
   --config=./config/yolov7/net/yolov7.yaml \
-  --recompute=True \
-  --recompute_layers=5 \
-  --batch_size=16 \
-  --epochs=300 > log.txt 2>&1 &
+  --device_target="Ascend" \
+  --ms_mode=1 \
+  --ms_strategy="DynamicShape" \
+  --batch_size=16 > log.txt 2>&1 &
 ```
 
 The python command above will run in the background, you can view the results through the file log.txt.
@@ -257,6 +264,12 @@ For Ascend device, distributed training example(8p) by shell script
 
 ```bash
 bash run_distribute_train_ascend.sh /path_to/hccl_8p.json
+```
+
+For GPU device, distributed training example(8p) by shell script
+
+```bash
+bash run_distribute_train_gpu_dynamic_shape.sh
 ```
 
 The above shell script will run distribute training in the background. You can view the results through the file train_parallel[X]/log.txt. The loss value will be achieved as follows:
