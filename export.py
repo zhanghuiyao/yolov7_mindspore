@@ -16,15 +16,13 @@
 python export.py
 """
 import os
-import yaml
 import numpy as np
 
 import mindspore as ms
 from mindspore import Tensor, export, context
 
-from config.args import get_args_310
-from network.yolo import Model
-
+from mindyolo.models.yolo import Model
+from mindyolo.utils.config import parse_args
 
 def run_export(opt):
     """
@@ -41,12 +39,8 @@ def run_export(opt):
         raise NotImplementedError
 
     # model init
-    with open(opt.hyp) as f:
-        hyp = yaml.load(f, Loader=yaml.SafeLoader)  # load hyps
-    with open(opt.data) as f:
-        data = yaml.load(f, Loader=yaml.SafeLoader)
-    nc = int(data['nc'])  # number of classes
-    net = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors'), sync_bn=False)  # create
+    nc = int(opt.nc)  # number of classes
+    net = Model(opt.cfg, ch=3, nc=nc, sync_bn=False)  # create
     assert isinstance(opt.weights, str) and opt.weights.endswith('.ckpt'), f"opt.weights is {opt.weights}"
     param_dict = ms.load_checkpoint(opt.weights)
     ms.load_param_into_net(net, param_dict)
@@ -55,10 +49,10 @@ def run_export(opt):
 
     # export
     input_arr = Tensor(np.ones([opt.per_batch_size, 3, opt.img_size, opt.img_size]), ms.float32)
-    file_name = os.path.basename(opt.cfg)[:-5] # delete ".yaml"
+    file_name = os.path.basename(opt.config)[:-5] # delete ".yaml"
     export(net, input_arr, file_name=file_name, file_format=opt.file_format)
 
 
 if __name__ == '__main__':
-    opt = get_args_310()
+    opt = parse_args("export")
     run_export(opt)

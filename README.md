@@ -100,9 +100,8 @@ other datasets need to use the same format as MS COCO.
   ```text
   #run training example(1p) by python command
   python train.py \
-      --cfg=./config/network_yolov7/yolov7.yaml \
-      --data=./config/data/coco.yaml \
-      --hyp=./config/data/hyp.scratch.p5.yaml \
+      --config=./config/yolov7/net/yolov7.yaml \
+      --device_target="Ascend" \
       --recompute=True \
       --recompute_layers=5 \
       --batch_size=16 \
@@ -116,6 +115,7 @@ other datasets need to use the same format as MS COCO.
 
   # run evaluation by python command
   python test.py \
+      --config=./config/yolov7/net/yolov7.yaml \
       --weights=/path_to/yolov7.ckpt \
       --img_size=640 > log.txt 2>&1 &
 
@@ -168,10 +168,14 @@ other datasets need to use the same format as MS COCO.
   ├─config
     ├─data
         ├─coco.yaml
-        ├─hyp.scratch.p5.yaml
-    ├─network_yolov7
-        ├─yolov7.yaml
-    ├─args.py
+    ├─yolov7
+        ├─hyp
+            ├─hyp.scratch.p5.yaml
+            ├─hyp.scratch.p6.yaml
+            ├─hyp.scratch.tiny.yaml
+        ├─net
+            ├─yolov7.yaml
+            ├─...
   ├─network
     ├─__init__.py
     ├─common.py
@@ -191,6 +195,8 @@ other datasets need to use the same format as MS COCO.
     ├─optimizer.py
     ├─plots.py
     ├─pth2ckpt.py
+    ├─args.py
+    ├─config.py
   ├─scripts
     ├─get_coco.sh
     ├─run_distribute_train_ascend.sh
@@ -206,7 +212,7 @@ other datasets need to use the same format as MS COCO.
 
 ## [Script Parameters](#contents)
 
-Major parameters config/hyp.scratch.p5.yaml as follows:
+Major parameters config/yolov7/hyp/hyp.scratch.p5.yaml as follows:
 
 Major parameters config/args.py as follows:
 
@@ -219,9 +225,7 @@ optional arguments:
                         Batch size for Training. Default: 128.
   --ms_loss_scaler      train loss scaler, default is "static".
   --weights             The ckpt file of YOLOv7, which used to fine tune. default is "".
-  --cfg                 model yaml path
-  --data                data yaml path
-  --hyp                 hyperparameters yaml path
+  --config              model and hyperparameters yaml path
 ```
 
 ## [Training Process](#contents)
@@ -236,9 +240,7 @@ bash run_standalone_train.sh 0
 
 ```text
 python train.py \
-  --cfg=./config/network_yolov7/yolov7.yaml \
-  --data=./config/data/coco.yaml \
-  --hyp=./config/data/hyp.scratch.p5.yaml \
+  --config=./config/yolov7/net/yolov7.yaml \
   --recompute=True \
   --recompute_layers=5 \
   --batch_size=16 \
@@ -292,6 +294,7 @@ python utils/checkpoint_fuse.py --num 80 --start 221 --base_name /path_to_weight
 
 ```shell
 python test.py \
+  --config=./config/yolov7/net/yolov7.yaml \
   --weights=/path_to/yolov7.ckpt \
   --img_size=640 > log.txt 2>&1 &
 OR

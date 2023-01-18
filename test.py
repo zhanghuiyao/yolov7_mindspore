@@ -2,29 +2,26 @@ import glob
 import os
 import time
 import json
-import yaml
 import datetime
 import numpy as np
 from pathlib import Path
-from threading import Thread
 
 import mindspore as ms
-from mindspore import Tensor, ops, nn
+from mindspore import Tensor, ops
 
-from network.yolo import Model
-from config.args import get_args_test
-from utils.general import coco80_to_coco91_class, check_file, check_img_size, xyxy2xywh, xywh2xyxy, \
-    colorstr, box_iou
-from utils.dataset import create_dataloader
-from utils.metrics import ConfusionMatrix, non_max_suppression, scale_coords, ap_per_class
-from utils.plots import plot_study_txt, plot_images, output_to_target
+from mindyolo.models.yolo import Model
+from mindyolo.utils.general import coco80_to_coco91_class, check_img_size, xyxy2xywh, xywh2xyxy, colorstr, box_iou
+from mindyolo.utils.dataset import create_dataloader
+from mindyolo.utils.metrics import ConfusionMatrix, non_max_suppression, scale_coords, ap_per_class
+from mindyolo.utils.config import parse_args
 
-def test(data,
+def test(opt,
          weights=None,
          batch_size=32,
          imgsz=640,
          conf_thres=0.001,
          iou_thres=0.6,  # for NMS
+         nms_time_limit=20.0, # for NMS
          save_json=False,
          single_cls=False,
          augment=False,
@@ -36,19 +33,13 @@ def test(data,
          save_txt=False,  # for auto-labelling
          save_hybrid=False,  # for hybrid auto-labelling
          save_conf=False,  # save auto-label confidences
-         plots=False,
          compute_loss=None,
          half_precision=False,
-         trace=False,
          is_coco=False,
          v5_metric=False):
 
-    # Configure
-    if isinstance(data, str):
-        is_coco = data.endswith('coco.yaml')
-        with open(data) as f:
-            data = yaml.load(f, Loader=yaml.SafeLoader)
-    nc = 1 if single_cls else int(data['nc'])  # number of classes
+    is_coco = opt.dataset_name == "coco"
+    nc = 1 if single_cls else int(opt.nc)  # number of classes
     iouv = np.linspace(0.5, 0.95, 10)  # iou vector for mAP@0.5:0.95
     niou = np.prod(iouv.shape)
 
@@ -60,10 +51,7 @@ def test(data,
         os.makedirs(os.path.join(save_dir, "labels"), exist_ok=False)
 
         # Load model
-        # Hyperparameters
-        with open(opt.hyp) as f:
-            hyp = yaml.load(f, Loader=yaml.SafeLoader)  # load hyps
-        model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors'), sync_bn=False)  # create
+        model = Model(opt.cfg, ch=3, nc=nc, sync_bn=False)  # create
         ckpt_path = weights
         param_dict = ms.load_checkpoint(ckpt_path)
         ms.load_param_into_net(model, param_dict)
@@ -71,20 +59,21 @@ def test(data,
         gs = max(int(ops.cast(model.stride, ms.float16).max()), 32)  # grid size (max stride)
         imgsz = check_img_size(imgsz, s=gs)  # check img_size
 
-        # Half
-        if half_precision:
-            ms.amp.auto_mixed_precision(model, amp_level="O2")
+    # Half
+    if half_precision:
+        ms.amp.auto_mixed_precision(model, amp_level="O2")
 
     model.set_train(False)
 
     # Dataloader
     if not training:
-        task = opt.task if opt.task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
-        dataloader, dataset, per_epoch_size = create_dataloader(data[task], imgsz, batch_size, gs, opt,
+        assert opt.task in ('train', 'val'), f"Not support task type {opt.task}"
+        data_path = opt.train_set if opt.task == "train" else opt.val_set # path to train/val/test images
+        dataloader, dataset, per_epoch_size = create_dataloader(data_path, imgsz, batch_size, gs, opt,
                                                                 epoch_size=1, pad=0.5, rect=False,
                                                                 num_parallel_workers=8, shuffle=False,
                                                                 drop_remainder=False,
-                                                                prefix=colorstr(f'{task}: '))
+                                                                prefix=colorstr(f'{opt.task}: '))
         assert per_epoch_size == dataloader.get_dataset_size()
         data_loader = dataloader.create_dict_iterator(output_numpy=True, num_epochs=1)
         print(f"Test create dataset success, epoch size {per_epoch_size}.")
@@ -98,7 +87,7 @@ def test(data,
         print("Testing with YOLOv5 AP metric...")
 
     seen = 0
-    confusion_matrix = ConfusionMatrix(nc=nc)
+    # confusion_matrix = ConfusionMatrix(nc=nc)
     names = {k: v for k, v in enumerate(model.names if hasattr(model, 'names') else model.module.names)}
     coco91class = coco80_to_coco91_class()
     p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
@@ -111,7 +100,7 @@ def test(data,
         dtype = ms.float16 if half_precision else ms.float32
         img = img.astype(np.float) / 255.0 # 0 - 255 to 0.0 - 1.0
         img_tensor = Tensor(img, dtype)
-        targets_tensor = Tensor(targets, dtype)
+        targets_tensor = Tensor(targets, dtype) if compute_loss else None
         targets = targets.reshape((-1, 6))
         targets = targets[targets[:, 1] >= 0]
         nb, _, height, width = img.shape  # batch size, channels, height, width
@@ -130,7 +119,8 @@ def test(data,
         lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
         t = time.time()
         out = pred_out.asnumpy()
-        out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
+        out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True,
+                                  time_limit=nms_time_limit)
         t1 += time.time() - t
 
         # Statistics per image
@@ -183,11 +173,11 @@ def test(data,
                 # target boxes
                 tbox = xywh2xyxy(labels[:, 1:5])
                 scale_coords(img[si].shape[1:], tbox, shapes[si][0, :], shapes[si][1:, :])  # native-space labels
-                if plots:
-                    confusion_matrix.process_batch(predn, np.concatenate((labels[:, 0:1], tbox), 1))
 
                 # Per target class
                 for cls in np.unique(tcls_np):
+                    # ti = (cls == tcls_np).nonzero(as_tuple=False).view(-1)  # prediction indices
+                    # pi = (cls == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # target indices
                     ti = np.nonzero(cls == tcls_np)[0].reshape(-1) # prediction indices
                     pi = np.nonzero(cls == pred[:, 5])[0].reshape(-1) # target indices
 
@@ -212,13 +202,6 @@ def test(data,
             # Append statistics (correct, conf, pcls, tcls)
             stats.append((correct, pred[:, 4], pred[:, 5], tcls))
 
-        # Plot images
-        if plots and batch_i < 3:
-            f = os.path.join(save_dir, f'test_batch{batch_i}_labels.jpg') # labels
-            Thread(target=plot_images, args=(img, targets, paths, f, names), daemon=True).start()
-            f = os.path.join(save_dir, f'test_batch{batch_i}_pred.jpg') # predictions
-            Thread(target=plot_images, args=(img, output_to_target(out), paths, f, names), daemon=True).start()
-
         print(f"Test step {batch_i + 1}/{per_epoch_size}, cost time {time.time() - s_time:.2f}s", flush=True)
 
         s_time = time.time()
@@ -226,7 +209,7 @@ def test(data,
     # Compute statistics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():
-        p, r, ap, f1, ap_class = ap_per_class(*stats, plot=plots, v5_metric=v5_metric, save_dir=save_dir, names=names)
+        p, r, ap, f1, ap_class = ap_per_class(*stats, plot=False, v5_metric=v5_metric, save_dir=save_dir, names=names)
         ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
         mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
         nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
@@ -247,15 +230,11 @@ def test(data,
     if not training:
         print('Speed: %.1f/%.1f/%.1f ms inference/NMS/total per %gx%g image at batch-size %g' % t)
 
-    # Plots
-    if plots:
-        confusion_matrix.plot(save_dir=save_dir, names=list(names.values()))
-
     # Save JSON
     if save_json and len(jdict):
         w = Path(weights).stem if weights is not None else ''  # weights
         # anno_json = './coco/annotations/instances_val2017.json'  # annotations json
-        anno_json = os.path.join(data["val"][:-12], "annotations/instances_val2017.json")
+        anno_json = os.path.join(opt.val_set[:-12], "annotations/instances_val2017.json")
         pred_json = os.path.join(save_dir, f"{w}_predictions.json") # predictions json
         print('\nEvaluating pycocotools mAP... saving %s...' % pred_json)
         with open(pred_json, 'w') as f:
@@ -291,22 +270,21 @@ def test(data,
 
 
 if __name__ == '__main__':
-    opt = get_args_test()
-    opt.save_json |= opt.data.endswith('coco.yaml')
-    opt.data, opt.cfg, opt.hyp = check_file(opt.data), check_file(opt.cfg), check_file(opt.hyp)  # check files
+    opt = parse_args("test")
     print(opt)
+    opt.save_json |= (opt.dataset_name == "coco")
 
-    ms_mode = ms.GRAPH_MODE if opt.ms_mode == "graph" else ms.PYNATIVE_MODE
-    ms.set_context(mode=ms_mode, device_target=opt.device_target)
+    ms.set_context(mode=opt.ms_mode, device_target=opt.device_target)
     ms.set_context(pynative_synchronize=True)
 
     if opt.task in ('train', 'val', 'test'):  # run normally
-        test(opt.data,
+        test(opt,
              opt.weights,
              opt.batch_size,
              opt.img_size,
              opt.conf_thres,
              opt.iou_thres,
+             opt.nms_time_limit,
              opt.save_json,
              opt.single_cls,
              opt.augment,
@@ -314,26 +292,8 @@ if __name__ == '__main__':
              save_txt=opt.save_txt | opt.save_hybrid,
              save_hybrid=opt.save_hybrid,
              save_conf=opt.save_conf,
-             trace=not opt.no_trace,
-             plots=False,
              half_precision=False,
              v5_metric=opt.v5_metric
              )
-
-    elif opt.task == 'speed':  # speed benchmarks
-        test(opt.data, opt.weights, opt.batch_size, opt.img_size, 0.25, 0.45,
-             save_json=False, plots=False, half_precision=False, v5_metric=opt.v5_metric)
-
-    elif opt.task == 'study':  # run over a range of settings and save/plot
-        # python test.py --task study --data coco.yaml --iou 0.65 --weights yolov7.ckpt
-        x = list(range(256, 1536 + 128, 128))  # x axis (image sizes)
-        f = f'study_{Path(opt.data).stem}_{Path(opt.weights).stem}.txt'  # filename to save to
-        y = []  # y axis
-        for i in x:  # img-size
-            print(f'\nRunning {f} point {i}...')
-            r, _, t = test(opt.data, opt.weights, opt.batch_size, i, opt.conf_thres, opt.iou_thres, opt.save_json,
-                           plots=False, half_precision=False, v5_metric=opt.v5_metric)
-            y.append(r + t)  # results and times
-        np.savetxt(f, y, fmt='%10.4g')  # save
-        os.system('zip -r study.zip study_*.txt')
-        plot_study_txt(x=x)  # plot
+    else:
+        raise NotImplementedError

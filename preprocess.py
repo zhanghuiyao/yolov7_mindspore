@@ -16,30 +16,24 @@
 pre-process for inference
 """
 import os
-import yaml
 import numpy as np
-from config.args import get_args_310
-from utils.dataset import create_dataloader
-from utils.general import colorstr
+from mindyolo.utils.dataset import create_dataloader
+from mindyolo.utils.general import colorstr
+from mindyolo.utils.config import parse_args
 
 def preprocess(opt):
     """
     generate img bin file
     """
     result_path = opt.output_path
-    with open(opt.data) as f:
-        data = yaml.load(f, Loader=yaml.SafeLoader)
-    with open(opt.hyp) as f:
-        hyp = yaml.load(f, Loader=yaml.SafeLoader)  # load hyps
-    with open(opt.cfg) as f:
-        cfg_ymal = yaml.load(f, Loader=yaml.SafeLoader)  # model dict
-    gs = max(max(cfg_ymal['stride']), 32)
+    # gs = max(int(ops.cast(model.stride, ms.float16).max()), 32)  # grid size (max stride)
+    gs = max(max(opt.stride), 32)
     task = 'val'
-    dataloader, _, per_epoch_size = create_dataloader(data[task], opt.img_size, opt.per_batch_size, gs, opt,
-                                                            epoch_size=1, pad=0.5, rect=False,
-                                                            num_parallel_workers=8, shuffle=False,
-                                                            drop_remainder=False,
-                                                            prefix=colorstr(f'{task}: '))
+    dataloader, _, per_epoch_size = create_dataloader(opt.val_set, opt.img_size, opt.per_batch_size, gs, opt,
+                                                      epoch_size=1, pad=0.5, rect=False,
+                                                      num_parallel_workers=8, shuffle=False,
+                                                      drop_remainder=False,
+                                                      prefix=colorstr(f'{task}: '))
     total_size = dataloader.get_dataset_size()
     assert per_epoch_size == total_size, "total size not equal per epoch size."
     print("Total {} images to preprocess...".format(total_size))
@@ -59,5 +53,5 @@ def preprocess(opt):
 
 
 if __name__ == '__main__':
-    opt = get_args_310()
+    opt = parse_args("export")
     preprocess(opt)

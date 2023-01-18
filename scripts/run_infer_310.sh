@@ -13,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===========================================================================
-if [ $# != 5 ] && [ $# != 2 ]
+if [ $# != 3 ] && [ $# != 2 ]
 then
     echo "Usage: bash run_infer_310.sh [MINDIR_PATH] [DEVICE_ID]"
     echo "OR"
-    echo "Usage: bash run_infer_310.sh [CONFIG_PATH] [DATA_PATH] [HYP_PATH] [MINDIR_PATH] [DEVICE_ID]"
+    echo "Usage: bash run_infer_310.sh [CONFIG_PATH] [MINDIR_PATH] [DEVICE_ID]"
 exit 1
 fi
 
@@ -35,24 +35,18 @@ if [ $# == 2 ]
 then
   model=$(get_real_path $1)
   device_id=$2
-  CONFIG_PATH=$"./config/network_yolov7/yolov7.yaml"
-  DATA_PATH=$"./config/data/coco.yaml"
-  HYP_PATH=$"./config/data/hyp.scratch.p5.yaml"
+  CONFIG_PATH=$"./config/yolov7/net/yolov7.yaml"
 fi
 
 if [ $# == 5 ]
 then
   CONFIG_PATH=$(get_real_path $1)
-  DATA_PATH=$(get_real_path $2)
-  HYP_PATH=$(get_real_path $3)
-  model=$(get_real_path $4)
-  device_id=$5
+  model=$(get_real_path $2)
+  device_id=$3
 fi
 
 echo $model
 echo $CONFIG_PATH
-echo $DATA_PATH
-echo $HYP_PATH
 
 function compile_app()
 {

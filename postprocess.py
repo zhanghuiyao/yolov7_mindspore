@@ -1,15 +1,14 @@
 import os
-import yaml
 import time
 import json
 import datetime
 import numpy as np
 from pathlib import Path
 
-from config.args import get_args_310
-from utils.general import coco80_to_coco91_class, xyxy2xywh, xywh2xyxy, colorstr, box_iou
-from utils.dataset import create_dataloader
-from utils.metrics import non_max_suppression, scale_coords, ap_per_class
+from mindyolo.utils.general import coco80_to_coco91_class, xyxy2xywh, xywh2xyxy, colorstr, box_iou
+from mindyolo.utils.dataset import create_dataloader
+from mindyolo.utils.metrics import non_max_suppression, scale_coords, ap_per_class
+from mindyolo.utils.config import parse_args
 
 def sigmoid(x):
     """
@@ -22,30 +21,23 @@ def postprocess(opt):
     generate img bin file
     """
     result_path = opt.result_path
-    with open(opt.data) as f:
-        data = yaml.load(f, Loader=yaml.SafeLoader)
-    with open(opt.hyp) as f:
-        hyp = yaml.load(f, Loader=yaml.SafeLoader)  # load hyps
-    with open(opt.cfg) as f:
-        cfg_ymal = yaml.load(f, Loader=yaml.SafeLoader)  # model dict
-    stride = cfg_ymal['stride']
+    stride, anchors, nc = opt.stride, opt.anchors, opt.nc
     gs = max(max(stride), 32)
-    anchors, nc = cfg_ymal['anchors'], cfg_ymal['nc']
     no = nc + 5
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
     num_layer = len(anchors)  # number of detection layers
     anchor_grid = np.array(anchors).reshape((num_layer, 1, -1, 1, 1, 2))
     iouv = np.linspace(0.5, 0.95, 10)  # iou vector for mAP@0.5:0.95
     niou = np.prod(iouv.shape)
-    save_json = opt.data.endswith('coco.yaml')
-    is_coco = opt.data.endswith('coco.yaml')
+    is_coco = (opt.dataset_name == "coco")
+    save_json = is_coco
 
     task = 'val'
-    dataloader, dataset, per_epoch_size = create_dataloader(data[task], opt.img_size, opt.per_batch_size, gs, opt,
-                                                      epoch_size=1, pad=0.5, rect=False,
-                                                      num_parallel_workers=8, shuffle=False,
-                                                      drop_remainder=False,
-                                                      prefix=colorstr(f'{task}: '))
+    dataloader, dataset, per_epoch_size = create_dataloader(opt.val_set, opt.img_size, opt.per_batch_size, gs, opt,
+                                                            epoch_size=1, pad=0.5, rect=False,
+                                                            num_parallel_workers=8, shuffle=False,
+                                                            drop_remainder=False,
+                                                            prefix=colorstr(f'{task}: '))
     total_size = dataloader.get_dataset_size()
     assert per_epoch_size == total_size, "total size not equal per epoch size."
     print("Total {} images to postprocess...".format(total_size))
@@ -63,7 +55,7 @@ def postprocess(opt):
         targets = targets.reshape((-1, 6))
         targets = targets[targets[:, 1] >= 0]
         nb, _, height, width = img.shape  # batch size, channels, height, width
-        out_size = [int(opt.img_size // s) for s in cfg_ymal['stride']]
+        out_size = [int(opt.img_size // s) for s in opt.stride]
         z = ()
         for _i in range(num_layer):
             ny, nx = out_size[_i], out_size[_i] # (bs,255,20,20)
@@ -129,6 +121,8 @@ def postprocess(opt):
 
                 # Per target class
                 for cls in np.unique(tcls_np):
+                    # ti = (cls == tcls_np).nonzero(as_tuple=False).view(-1)  # prediction indices
+                    # pi = (cls == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # target indices
                     ti = np.nonzero(cls == tcls_np)[0].reshape(-1) # prediction indices
                     pi = np.nonzero(cls == pred[:, 5])[0].reshape(-1) # target indices
 
@@ -180,7 +174,8 @@ def postprocess(opt):
     # Save JSON
     if save_json and len(jdict):
         w = 'yolov7'  # weights
-        anno_json = os.path.join(data["val"][:-12], "annotations/instances_val2017.json")
+        # anno_json = './coco/annotations/instances_val2017.json'  # annotations json
+        anno_json = os.path.join(opt.val_set[:-12], "annotations/instances_val2017.json")
         pred_json = os.path.join(save_dir, f"{w}_predictions.json")  # predictions json
         print('\nEvaluating pycocotools mAP... saving %s...' % pred_json)
         with open(pred_json, 'w') as f:
@@ -208,5 +203,5 @@ def postprocess(opt):
 
 
 if __name__ == '__main__':
-    opt = get_args_310()
+    opt = parse_args("export")
     postprocess(opt)

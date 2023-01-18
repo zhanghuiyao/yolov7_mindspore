@@ -1,15 +1,12 @@
 #!/bin/bash
 
-if [ $# != 2 ] && [ $# != 5 ]
+if [ $# != 2 ] && [ $# != 3 ]
 then
     echo "Usage: bash run_standalone_test_gpu.sh [WEIGHTS] [DEVICE_ID]"
     echo "OR"
-    echo "Usage: bash run_standalone_test_gpu.sh [WEIGHTS] [DEVICE_ID] [CONFIG_PATH] [DATA_PATH] [HYP_PATH]"
+    echo "Usage: bash run_standalone_test_gpu.sh [CONFIG_PATH] [WEIGHTS] [DEVICE_ID]"
 exit 1
 fi
-
-WEIGHTS=$1
-export CUDA_VISIBLE_DEVICES=$2
 
 get_real_path(){
   if [ "${1:0:1}" == "/" ]; then
@@ -21,38 +18,33 @@ get_real_path(){
 
 if [ $# == 2 ]
 then
-  CONFIG_PATH=$"./config/network_yolov7/yolov7.yaml"
-  DATA_PATH=$"./config/data/coco.yaml"
-  HYP_PATH=$"./config/data/hyp.scratch.p5.yaml"
+  WEIGHTS=$1
+  DEVICE_ID=$2
+  CONFIG_PATH=$"./config/yolov7/net/yolov7.yaml"
 fi
 
-if [ $# == 5 ]
+if [ $# == 3 ]
 then
-  CONFIG_PATH=$(get_real_path $3)
-  DATA_PATH=$(get_real_path $4)
-  HYP_PATH=$(get_real_path $5)
+  WEIGHTS=$2
+  DEVICE_ID=$3
+  CONFIG_PATH=$(get_real_path $1)
 fi
 
 echo $CONFIG_PATH
-echo $DATA_PATH
-echo $HYP_PATH
-
+export CUDA_VISIBLE_DEVICES=$DEVICE_ID
 export DEVICE_NUM=1
-rm -rf ./test_standalone$2
-mkdir ./test_standalone$2
-cp ../*.py ./test_standalone$2
-cp -r ../config ./test_standalone$2
-cp -r ../network ./test_standalone$2
-cp -r ../utils ./test_standalone$2
-mkdir ./test_standalone$2/scripts
-cp -r ../scripts/*.sh ./test_standalone$2/scripts/
-cd ./test_standalone$2 || exit
+rm -rf ./test_standalone$DEVICE_ID
+mkdir ./test_standalone$DEVICE_ID
+cp ../*.py ./test_standalone$DEVICE_ID
+cp -r ../config ./test_standalone$DEVICE_ID
+cp -r ../mindyolo ./test_standalone$DEVICE_ID
+mkdir ./test_standalone$DEVICE_ID/scripts
+cp -r ../scripts/*.sh ./test_standalone$DEVICE_ID/scripts/
+cd ./test_standalone$DEVICE_ID || exit
 env > env.log
 python test.py \
   --weights=$WEIGHTS \
-  --cfg=$CONFIG_PATH \
-  --data=$DATA_PATH \
-  --hyp=$HYP_PATH \
+  --config=$CONFIG_PATH \
   --device_target=GPU \
   --task="val" \
   --img_size=640 \
