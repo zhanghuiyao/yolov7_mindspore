@@ -167,8 +167,8 @@ def train(opt):
         elif opt.ms_strategy == "MultiShape":
             raise NotImplementedError
         elif opt.ms_strategy == "DynamicShape":
-            assert opt.ms_mode == "pynative", f"The dynamic shape function under static graph is under development. Please " \
-                                              f"look forward to the subsequent MS version."
+            assert opt.ms_mode == 1, f"The dynamic shape function under static graph is under development. Please " \
+                                     f"look forward to the subsequent MS version."
             train_step = create_train_dynamic_shape_fn(model, optimizer, loss_scaler, grad_reducer,
                                                        amp_level=opt.ms_amp_level)
         else:

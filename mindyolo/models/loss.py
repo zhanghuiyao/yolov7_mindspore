@@ -1406,34 +1406,35 @@ class ComputeLossOTA_dynamic(nn.Cell):
             tobj = ops.zeros_like(pi[..., 0])  # target obj
 
             n = b.shape[0]  # number of targets
-            ps = pi[b, a, gj, gi]  # prediction subset corresponding to targets
+            if n > 0:
+                ps = pi[b, a, gj, gi]  # prediction subset corresponding to targets
 
-            # Regression
-            grid = ops.stack([gi, gj], axis=1)
-            pxy = ops.Sigmoid()(ps[:, :2]) * 2. - 0.5
-            pwh = (ops.Sigmoid()(ps[:, 2:4]) * 2) ** 2 * anchors[i]
-            pbox = ops.concat((pxy, pwh), 1)  # predicted box
-            selected_tbox = targets[i][:, 2:6] * pre_gen_gains[i]
+                # Regression
+                grid = ops.stack([gi, gj], axis=1)
+                pxy = ops.Sigmoid()(ps[:, :2]) * 2. - 0.5
+                pwh = (ops.Sigmoid()(ps[:, 2:4]) * 2) ** 2 * anchors[i]
+                pbox = ops.concat((pxy, pwh), 1)  # predicted box
+                selected_tbox = targets[i][:, 2:6] * pre_gen_gains[i]
 
-            # selected_tbox[:, 0:2] -= grid
-            # _selected_tbox_1, _selected_tbox_2 = ops.split(selected_tbox, 1, 2) # ms 1.8.1
-            _selected_tbox_1, _selected_tbox_2 = ops.split(selected_tbox, 2, 1) # ms 2.0.0
-            _selected_tbox_1 -= grid
-            selected_tbox = ops.concat((_selected_tbox_1, _selected_tbox_2), 1)
+                selected_tbox[:, 0:2] -= grid
+                # # _selected_tbox_1, _selected_tbox_2 = ops.split(selected_tbox, 1, 2) # ms 1.8.1
+                # _selected_tbox_1, _selected_tbox_2 = ops.split(selected_tbox, 2, 1) # ms 2.0.0
+                # _selected_tbox_1 -= grid
+                # selected_tbox = ops.concat((_selected_tbox_1, _selected_tbox_2), 1)
 
-            iou = bbox_iou_2(pbox, selected_tbox, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
-            lbox += (1.0 - iou).mean() # iou loss
+                iou = bbox_iou_2(pbox, selected_tbox, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
+                lbox += (1.0 - iou).mean() # iou loss
 
-            # Objectness
-            tobj[b, a, gj, gi] = ops.ones(iou.shape, iou.dtype) * \
-                                 ((1.0 - self.gr) + self.gr * ops.stop_gradient(iou).clip(0, None)) # iou ratio
+                # Objectness
+                tobj[b, a, gj, gi] = ops.ones(iou.shape, iou.dtype) * \
+                                     ((1.0 - self.gr) + self.gr * ops.stop_gradient(iou).clip(0, None)) # iou ratio
 
-            # Classification
-            selected_tcls = ops.cast(targets[i][:, 1], ms.int32)
-            if self.nc > 1:  # cls loss (only if multiple classes)
-                t = ops.ones_like(ps[:, 5:]) * self.cn # targets
-                t[mnp.arange(n), selected_tcls.view(n)] = self.cp
-                lcls += self.BCEcls(ps[:, 5:], t)  # BCE
+                # Classification
+                selected_tcls = ops.cast(targets[i][:, 1], ms.int32)
+                if self.nc > 1:  # cls loss (only if multiple classes)
+                    t = ops.ones_like(ps[:, 5:]) * self.cn # targets
+                    t[mnp.arange(n), selected_tcls.view(n)] = self.cp
+                    lcls += self.BCEcls(ps[:, 5:], t)  # BCE
 
             obji = self.BCEobj(pi[..., 4], tobj)
             lobj += obji * self.balance[i]  # obj loss
@@ -1468,8 +1469,10 @@ class ComputeLossOTA_dynamic(nn.Cell):
 
         for batch_idx in range(p[0].shape[0]):
             b_idx = (targets[:, 0] == batch_idx) # (n_tb,)
-            # this_target = ops.masked_select(targets, ops.tile(b_idx[:, None], (1, 6))).view(-1, 6) # (n_tb, 6)
-            this_target = ops.masked_select(targets, ops.broadcast_to(b_idx[:, None], b_idx.shape + (6,))).view(-1, 6)  # (n_tb, 6)
+            if b_idx.shape[0] == 0:
+                continue
+            this_target = ops.masked_select(targets, ops.tile(b_idx[:, None], (1, 6))).view(-1, 6) # (n_tb, 6)
+            # this_target = ops.masked_select(targets, ops.broadcast_to(b_idx[:, None], b_idx.shape + (6,))).view(-1, 6)  # (n_tb, 6)
             if this_target.shape[0] == 0:
                 continue
 
@@ -1492,10 +1495,12 @@ class ComputeLossOTA_dynamic(nn.Cell):
                 b, a, gj, gi = b.view(-1), a.view(-1), gj.view(-1), gi.view(-1)
 
                 idx = (b == batch_idx) # (n_tp_b,)
+                if idx.sum() == 0:
+                    continue
                 b, a, gj, gi = ops.masked_select(b, idx), ops.masked_select(a, idx), \
                                ops.masked_select(gj, idx), ops.masked_select(gi, idx)
-                # _this_anch = ops.masked_select(anch[i], ops.tile(idx[:, None], (1, 2))).view(-1, 2) # (n_tp_b, 2)
-                _this_anch = ops.masked_select(anch[i], ops.broadcast_to(idx[:, None], idx.shape + (2,))).view(-1, 2)  # (n_tp_b, 2)
+                _this_anch = ops.masked_select(anch[i], ops.tile(idx[:, None], (1, 2))).view(-1, 2) # (n_tp_b, 2)
+                # _this_anch = ops.masked_select(anch[i], ops.broadcast_to(idx[:, None], idx.shape + (2,))).view(-1, 2)  # (n_tp_b, 2)
                 all_b += (b,)
                 all_a += (a,)
                 all_gj += (gj,)
@@ -1514,9 +1519,9 @@ class ComputeLossOTA_dynamic(nn.Cell):
                 pxyxy = self.xywh2xyxy(pxywh)
                 pxyxys += (pxyxy,)
 
-            pxyxys = ops.concat(pxyxys, axis=0) # (n_tp, 4)
-            if pxyxys.shape[0] == 0:
+            if len(pxyxys) == 0:
                 continue
+            pxyxys = ops.concat(pxyxys, axis=0) # (n_tp, 4)
             p_obj = ops.concat(p_obj, axis=0) # (n_tp, 1)
             p_cls = ops.concat(p_cls, axis=0) # (n_tp, 80)
             from_which_layer = ops.concat(from_which_layer, axis=0)
@@ -1536,14 +1541,14 @@ class ComputeLossOTA_dynamic(nn.Cell):
                                            depth=self.nc,
                                            on_value=ops.ones(1, pair_wise_iou.dtype),
                                            off_value=ops.zeros(1, pair_wise_iou.dtype)) # (n_tb, 80)
-            # gt_cls_per_image = ops.tile(gt_cls_per_image[:, None, :], (1, pxyxys.shape[0], 1)) # (n_tb, n_tp, 85)
-            gt_cls_per_image = ops.broadcast_to(gt_cls_per_image[:, None, :], (gt_cls_per_image.shape[0], pxyxys.shape[0], gt_cls_per_image.shape[1]))  # (n_tb, n_tp, 85)
+            gt_cls_per_image = ops.tile(gt_cls_per_image[:, None, :], (1, pxyxys.shape[0], 1)) # (n_tb, n_tp, 85)
+            # gt_cls_per_image = ops.broadcast_to(gt_cls_per_image[:, None, :], (gt_cls_per_image.shape[0], pxyxys.shape[0], gt_cls_per_image.shape[1]))  # (n_tb, n_tp, 85)
 
             num_gt = this_target.shape[0]
-            # cls_preds_ = ops.Sigmoid()(ops.tile(p_cls[None, :, :], (num_gt, 1, 1))) * \
-            #              ops.Sigmoid()(ops.tile(p_obj[None, :, :], (num_gt, 1, 1))) # (n_tb, n_tp, 80)
-            cls_preds_ = ops.Sigmoid()(ops.broadcast_to(p_cls[None, :, :], (num_gt,) + p_cls.shape)) * \
-                         ops.Sigmoid()(ops.broadcast_to(p_obj[None, :, :], (num_gt,) + p_obj.shape))  # (n_tb, n_tp, 80)
+            cls_preds_ = ops.Sigmoid()(ops.tile(p_cls[None, :, :], (num_gt, 1, 1))) * \
+                         ops.Sigmoid()(ops.tile(p_obj[None, :, :], (num_gt, 1, 1))) # (n_tb, n_tp, 80)
+            # cls_preds_ = ops.Sigmoid()(ops.broadcast_to(p_cls[None, :, :], (num_gt,) + p_cls.shape)) * \
+            #              ops.Sigmoid()(ops.broadcast_to(p_obj[None, :, :], (num_gt,) + p_obj.shape))  # (n_tb, n_tp, 80)
 
             y = ops.sqrt(cls_preds_)
             pair_wise_cls_loss = ops.binary_cross_entropy_with_logits(
@@ -1575,12 +1580,12 @@ class ComputeLossOTA_dynamic(nn.Cell):
             anchor_matching_mask = anchor_matching_gt > 1  # (n_tp,)
             anchor_matching_mask_idx = ops.masked_select(mnp.arange(cost.shape[1]), anchor_matching_mask)
             if anchor_matching_mask.astype(cost.dtype).sum() > 0:
-                # cost_argmin = ops.argmin(ops.masked_select(cost,
-                #                                            ops.tile(anchor_matching_mask[None, :], (cost.shape[0], 1))
-                #                                            ).view(cost.shape[0], -1), axis=0)
                 cost_argmin = ops.argmin(ops.masked_select(cost,
-                                                           ops.broadcast_to(anchor_matching_mask[None, :], (cost.shape[0],) + anchor_matching_mask.shape)
+                                                           ops.tile(anchor_matching_mask[None, :], (cost.shape[0], 1))
                                                            ).view(cost.shape[0], -1), axis=0)
+                # cost_argmin = ops.argmin(ops.masked_select(cost,
+                #                                            ops.broadcast_to(anchor_matching_mask[None, :], (cost.shape[0],) + anchor_matching_mask.shape)
+                #                                            ).view(cost.shape[0], -1), axis=0)
                 # matching_matrix[:, anchor_matching_mask_idx] *= 0.0
                 matching_matrix *= 1 - anchor_matching_mask.astype(matching_matrix.dtype)
                 matching_matrix[cost_argmin, anchor_matching_mask_idx] = 1.0
@@ -1659,19 +1664,19 @@ class ComputeLossOTA_dynamic(nn.Cell):
         targets = targets.view(-1, 6) # (bs, gt_max, 6) -> (bs*gt_max, 6)
         mask_t = targets[:, 1] >= 0 # (bs*gt_max,)
 
-        # targets = ops.masked_select(targets, ops.tile(mask_t[:, None], (1, 6))).view(-1, 6) # (nt, 6)
-        targets = ops.masked_select(targets, ops.broadcast_to(mask_t[:, None], mask_t.shape + (6,))).view(-1, 6)  # (nt, 6)
+        targets = ops.masked_select(targets, ops.tile(mask_t[:, None], (1, 6))).view(-1, 6) # (nt, 6)
+        # targets = ops.masked_select(targets, ops.broadcast_to(mask_t[:, None], mask_t.shape + (6,))).view(-1, 6)  # (nt, 6)
 
         na, nt = self.na, targets.shape[0]  # number of anchors, targets
         indices, anch, tmasks = (), (), ()
         gain = ops.ones(7, ms.int32)  # normalized to gridspace gain
 
-        # ai = ops.tile(mnp.arange(na, dtype=targets.dtype).view(na, 1), (1, nt)) # shape: (na, nt)
-        ai = ops.broadcast_to(mnp.arange(na, dtype=targets.dtype).view(na, 1), (na, nt))
+        ai = ops.tile(mnp.arange(na, dtype=targets.dtype).view(na, 1), (1, nt)) # shape: (na, nt)
+        # ai = ops.broadcast_to(mnp.arange(na, dtype=targets.dtype).view(na, 1), (na, nt))
 
         # (na, nt, 7)
-        # targets = ops.concat((ops.tile(targets[None, :, :], (na, 1, 1)), ai[:, :, None]), 2)  # append anchor indices # not support dynamic shape
-        targets = ops.concat((ops.broadcast_to(targets[None, :, :], (na,) + targets.shape[:]), ai[:, :, None]), 2) # append anchor indices
+        targets = ops.concat((ops.tile(targets[None, :, :], (na, 1, 1)), ai[:, :, None]), 2)  # append anchor indices # not support dynamic shape
+        # targets = ops.concat((ops.broadcast_to(targets[None, :, :], (na,) + targets.shape[:]), ai[:, :, None]), 2) # append anchor indices
 
         g = 0.5  # bias
         off = ops.cast(self._off, targets.dtype) * g  # offsets
@@ -1687,8 +1692,8 @@ class ComputeLossOTA_dynamic(nn.Cell):
                 r = t[:, :, 4:6] / anchors[:, None, :]  # wh ratio # (na, nt, 2)
                 j = ops.maximum(r, 1. / r).max(2) < self.hyp_anchor_t  # compare # (na, nt)
 
-                # t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7) # (nm, 7)
-                t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm, 7)
+                t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7) # (nm, 7)
+                # t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm, 7)
 
                 # t = t[j]  # filter
 
@@ -1703,14 +1708,14 @@ class ComputeLossOTA_dynamic(nn.Cell):
                 # original
                 j = ops.stack((ops.ones_like(j), j, k, l, m))  # shape: (5, nm)
 
-                # t = ops.tile(t, (5, 1, 1))  # shape(5, nm, 7)
-                # t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7)  # (nm_2, 7)
-                t = ops.broadcast_to(t, (5,) + t.shape)
-                t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm_2, 7)
+                t = ops.tile(t, (5, 1, 1))  # shape(5, nm, 7)
+                t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7)  # (nm_2, 7)
+                # t = ops.broadcast_to(t, (5,) + t.shape)
+                # t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm_2, 7)
 
                 offsets = ops.zeros_like(gxy)[None, :, :] + off[:, None, :] # (5, nm, 2)
-                # offsets = ops.masked_select(offsets, ops.tile(j[:, :, None], (1, 1, 2))).view(-1, 2)
-                offsets = ops.masked_select(offsets, ops.broadcast_to(j[:, :, None], j.shape + (2,))).view(-1, 2)
+                offsets = ops.masked_select(offsets, ops.tile(j[:, :, None], (1, 1, 2))).view(-1, 2)
+                # offsets = ops.masked_select(offsets, ops.broadcast_to(j[:, :, None], j.shape + (2,))).view(-1, 2)
             else:
                 t = targets[0]
                 offsets = 0
@@ -1807,54 +1812,56 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
 
             # 1. Branch Common
             n = b.shape[0]  # number of targets
-            ps = pi[b, a, gj, gi]  # prediction subset corresponding to targets
-            # Regression
-            grid = ops.stack([gi, gj], axis=1)
-            pxy = ops.Sigmoid()(ps[:, :2]) * 2. - 0.5
-            pwh = (ops.Sigmoid()(ps[:, 2:4]) * 2) ** 2 * anchors[i]
-            pbox = ops.concat((pxy, pwh), 1)  # predicted box
-            selected_tbox = targets[i][:, 2:6] * pre_gen_gains[i]
-            # selected_tbox[:, 0:2] -= grid
-            # _selected_tbox_1, _selected_tbox_2 = ops.split(selected_tbox, 1, 2) # ms 1.8.1
-            _selected_tbox_1, _selected_tbox_2 = ops.split(selected_tbox, 2, 1) # ms 2.0.0
-            _selected_tbox_1 -= grid
-            selected_tbox = ops.concat((_selected_tbox_1, _selected_tbox_2), 1)
-            iou = bbox_iou_2(pbox, selected_tbox, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
-            lbox += (1.0 - iou).mean() # iou loss
-            # Objectness
-            tobj[b, a, gj, gi] = ops.ones(iou.shape, iou.dtype) * \
-                                 ((1.0 - self.gr) + self.gr * ops.stop_gradient(iou).clip(0, None)) # iou ratio
-            # Classification
-            selected_tcls = ops.cast(targets[i][:, 1], ms.int32)
-            if self.nc > 1:  # cls loss (only if multiple classes)
-                t = ops.ones_like(ps[:, 5:]) * self.cn # targets
-                t[mnp.arange(n), selected_tcls.view(n)] = self.cp
-                lcls += self.BCEcls(ps[:, 5:], t)  # BCE
+            if n > 0:
+                ps = pi[b, a, gj, gi]  # prediction subset corresponding to targets
+                # Regression
+                grid = ops.stack([gi, gj], axis=1)
+                pxy = ops.Sigmoid()(ps[:, :2]) * 2. - 0.5
+                pwh = (ops.Sigmoid()(ps[:, 2:4]) * 2) ** 2 * anchors[i]
+                pbox = ops.concat((pxy, pwh), 1)  # predicted box
+                selected_tbox = targets[i][:, 2:6] * pre_gen_gains[i]
+
+                selected_tbox[:, 0:2] -= grid
+                # # _selected_tbox_1, _selected_tbox_2 = ops.split(selected_tbox, 1, 2) # ms 1.8.1
+                # _selected_tbox_1, _selected_tbox_2 = ops.split(selected_tbox, 2, 1) # ms 2.0.0
+                # _selected_tbox_1 -= grid
+                # selected_tbox = ops.concat((_selected_tbox_1, _selected_tbox_2), 1)
+                iou = bbox_iou_2(pbox, selected_tbox, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
+                lbox += (1.0 - iou).mean() # iou loss
+                # Objectness
+                tobj[b, a, gj, gi] = ops.ones(iou.shape, iou.dtype) * \
+                                     ((1.0 - self.gr) + self.gr * ops.stop_gradient(iou).clip(0, None)) # iou ratio
+                # Classification
+                selected_tcls = ops.cast(targets[i][:, 1], ms.int32)
+                if self.nc > 1:  # cls loss (only if multiple classes)
+                    t = ops.ones_like(ps[:, 5:]) * self.cn # targets
+                    t[mnp.arange(n), selected_tcls.view(n)] = self.cp
+                    lcls += self.BCEcls(ps[:, 5:], t)  # BCE
 
             # 2. Branch Aux
             n_aux = b_aux.shape[0]  # number of targets
-            ps_aux = pi_aux[b_aux, a_aux, gj_aux, gi_aux]  # prediction subset corresponding to targets
-            # Regression
-            grid_aux = ops.stack([gi_aux, gj_aux], axis=1)
-            pxy_aux = ops.Sigmoid()(ps_aux[:, :2]) * 2. - 0.5
-            pwh_aux = (ops.Sigmoid()(ps_aux[:, 2:4]) * 2) ** 2 * anchors_aux[i]
-            pbox_aux = ops.concat((pxy_aux, pwh_aux), 1)  # predicted box
-            selected_tbox_aux = targets_aux[i][:, 2:6] * pre_gen_gains_aux[i]
-            _selected_tbox_1_aux, _selected_tbox_2_aux = ops.split(selected_tbox_aux, 2, 1)  # ms 2.0.0
-            _selected_tbox_1_aux -= grid_aux
-            selected_tbox_aux = ops.concat((_selected_tbox_1_aux, _selected_tbox_2_aux), 1)
-            iou_aux = bbox_iou_2(pbox_aux, selected_tbox_aux, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
-            lbox += 0.25 * (1.0 - iou_aux).mean()  # iou loss
-            # Objectness
-            tobj_aux[b_aux, a_aux, gj_aux, gi_aux] = ops.ones(iou_aux.shape, iou_aux.dtype) * \
-                                 ((1.0 - self.gr) + self.gr * ops.stop_gradient(iou_aux).clip(0, None))  # iou ratio
-            # Classification
-            selected_tcls_aux = ops.cast(targets_aux[i][:, 1], ms.int32)
-            if self.nc > 1:  # cls loss (only if multiple classes)
-                t_aux = ops.ones_like(ps_aux[:, 5:]) * self.cn  # targets
-                t_aux[mnp.arange(n_aux), selected_tcls_aux.view(n_aux)] = self.cp
-                lcls += 0.25 * self.BCEcls(ps_aux[:, 5:], t_aux)  # BCE
-
+            if n_aux > 0:
+                ps_aux = pi_aux[b_aux, a_aux, gj_aux, gi_aux]  # prediction subset corresponding to targets
+                # Regression
+                grid_aux = ops.stack([gi_aux, gj_aux], axis=1)
+                pxy_aux = ops.Sigmoid()(ps_aux[:, :2]) * 2. - 0.5
+                pwh_aux = (ops.Sigmoid()(ps_aux[:, 2:4]) * 2) ** 2 * anchors_aux[i]
+                pbox_aux = ops.concat((pxy_aux, pwh_aux), 1)  # predicted box
+                selected_tbox_aux = targets_aux[i][:, 2:6] * pre_gen_gains_aux[i]
+                _selected_tbox_1_aux, _selected_tbox_2_aux = ops.split(selected_tbox_aux, 2, 1)  # ms 2.0.0
+                _selected_tbox_1_aux -= grid_aux
+                selected_tbox_aux = ops.concat((_selected_tbox_1_aux, _selected_tbox_2_aux), 1)
+                iou_aux = bbox_iou_2(pbox_aux, selected_tbox_aux, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
+                lbox += 0.25 * (1.0 - iou_aux).mean()  # iou loss
+                # Objectness
+                tobj_aux[b_aux, a_aux, gj_aux, gi_aux] = ops.ones(iou_aux.shape, iou_aux.dtype) * \
+                                     ((1.0 - self.gr) + self.gr * ops.stop_gradient(iou_aux).clip(0, None))  # iou ratio
+                # Classification
+                selected_tcls_aux = ops.cast(targets_aux[i][:, 1], ms.int32)
+                if self.nc > 1:  # cls loss (only if multiple classes)
+                    t_aux = ops.ones_like(ps_aux[:, 5:]) * self.cn  # targets
+                    t_aux[mnp.arange(n_aux), selected_tcls_aux.view(n_aux)] = self.cp
+                    lcls += 0.25 * self.BCEcls(ps_aux[:, 5:], t_aux)  # BCE
 
             obji = self.BCEobj(pi[..., 4], tobj)
             obji_aux = self.BCEobj(pi_aux[..., 4], tobj_aux)
@@ -1890,8 +1897,10 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
 
         for batch_idx in range(p[0].shape[0]):
             b_idx = (targets[:, 0] == batch_idx) # (n_tb,)
-            # this_target = ops.masked_select(targets, ops.tile(b_idx[:, None], (1, 6))).view(-1, 6) # (n_tb, 6)
-            this_target = ops.masked_select(targets, ops.broadcast_to(b_idx[:, None], b_idx.shape + (6,))).view(-1, 6)  # (n_tb, 6)
+            if b_idx.shape[0] == 0:
+                continue
+            this_target = ops.masked_select(targets, ops.tile(b_idx[:, None], (1, 6))).view(-1, 6) # (n_tb, 6)
+            # this_target = ops.masked_select(targets, ops.broadcast_to(b_idx[:, None], b_idx.shape + (6,))).view(-1, 6)  # (n_tb, 6)
             if this_target.shape[0] == 0:
                 continue
 
@@ -1914,10 +1923,12 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
                 b, a, gj, gi = b.view(-1), a.view(-1), gj.view(-1), gi.view(-1)
 
                 idx = (b == batch_idx) # (n_tp_b,)
+                if idx.sum() == 0:
+                    continue
                 b, a, gj, gi = ops.masked_select(b, idx), ops.masked_select(a, idx), \
                                ops.masked_select(gj, idx), ops.masked_select(gi, idx)
-                # _this_anch = ops.masked_select(anch[i], ops.tile(idx[:, None], (1, 2))).view(-1, 2) # (n_tp_b, 2)
-                _this_anch = ops.masked_select(anch[i], ops.broadcast_to(idx[:, None], idx.shape + (2,))).view(-1, 2)  # (n_tp_b, 2)
+                _this_anch = ops.masked_select(anch[i], ops.tile(idx[:, None], (1, 2))).view(-1, 2) # (n_tp_b, 2)
+                # _this_anch = ops.masked_select(anch[i], ops.broadcast_to(idx[:, None], idx.shape + (2,))).view(-1, 2)  # (n_tp_b, 2)
                 all_b += (b,)
                 all_a += (a,)
                 all_gj += (gj,)
@@ -1936,9 +1947,9 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
                 pxyxy = self.xywh2xyxy(pxywh)
                 pxyxys += (pxyxy,)
 
-            pxyxys = ops.concat(pxyxys, axis=0) # (n_tp, 4)
-            if pxyxys.shape[0] == 0:
+            if len(pxyxys) == 0:
                 continue
+            pxyxys = ops.concat(pxyxys, axis=0) # (n_tp, 4)
             p_obj = ops.concat(p_obj, axis=0) # (n_tp, 1)
             p_cls = ops.concat(p_cls, axis=0) # (n_tp, 80)
             from_which_layer = ops.concat(from_which_layer, axis=0)
@@ -1958,14 +1969,14 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
                                            depth=self.nc,
                                            on_value=ops.ones(1, pair_wise_iou.dtype),
                                            off_value=ops.zeros(1, pair_wise_iou.dtype)) # (n_tb, 80)
-            # gt_cls_per_image = ops.tile(gt_cls_per_image[:, None, :], (1, pxyxys.shape[0], 1)) # (n_tb, n_tp, 85)
-            gt_cls_per_image = ops.broadcast_to(gt_cls_per_image[:, None, :], (gt_cls_per_image.shape[0], pxyxys.shape[0], gt_cls_per_image.shape[1]))  # (n_tb, n_tp, 85)
+            gt_cls_per_image = ops.tile(gt_cls_per_image[:, None, :], (1, pxyxys.shape[0], 1)) # (n_tb, n_tp, 85)
+            # gt_cls_per_image = ops.broadcast_to(gt_cls_per_image[:, None, :], (gt_cls_per_image.shape[0], pxyxys.shape[0], gt_cls_per_image.shape[1]))  # (n_tb, n_tp, 85)
 
             num_gt = this_target.shape[0]
-            # cls_preds_ = ops.Sigmoid()(ops.tile(p_cls[None, :, :], (num_gt, 1, 1))) * \
-            #              ops.Sigmoid()(ops.tile(p_obj[None, :, :], (num_gt, 1, 1))) # (n_tb, n_tp, 80)
-            cls_preds_ = ops.Sigmoid()(ops.broadcast_to(p_cls[None, :, :], (num_gt,) + p_cls.shape)) * \
-                         ops.Sigmoid()(ops.broadcast_to(p_obj[None, :, :], (num_gt,) + p_obj.shape))  # (n_tb, n_tp, 80)
+            cls_preds_ = ops.Sigmoid()(ops.tile(p_cls[None, :, :], (num_gt, 1, 1))) * \
+                         ops.Sigmoid()(ops.tile(p_obj[None, :, :], (num_gt, 1, 1))) # (n_tb, n_tp, 80)
+            # cls_preds_ = ops.Sigmoid()(ops.broadcast_to(p_cls[None, :, :], (num_gt,) + p_cls.shape)) * \
+            #              ops.Sigmoid()(ops.broadcast_to(p_obj[None, :, :], (num_gt,) + p_obj.shape))  # (n_tb, n_tp, 80)
 
             y = ops.sqrt(cls_preds_)
             pair_wise_cls_loss = ops.binary_cross_entropy_with_logits(
@@ -1997,12 +2008,12 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
             anchor_matching_mask = anchor_matching_gt > 1  # (n_tp,)
             anchor_matching_mask_idx = ops.masked_select(mnp.arange(cost.shape[1]), anchor_matching_mask)
             if anchor_matching_mask.astype(cost.dtype).sum() > 0:
-                # cost_argmin = ops.argmin(ops.masked_select(cost,
-                #                                            ops.tile(anchor_matching_mask[None, :], (cost.shape[0], 1))
-                #                                            ).view(cost.shape[0], -1), axis=0)
                 cost_argmin = ops.argmin(ops.masked_select(cost,
-                                                           ops.broadcast_to(anchor_matching_mask[None, :], (cost.shape[0],) + anchor_matching_mask.shape)
+                                                           ops.tile(anchor_matching_mask[None, :], (cost.shape[0], 1))
                                                            ).view(cost.shape[0], -1), axis=0)
+                # cost_argmin = ops.argmin(ops.masked_select(cost,
+                #                                            ops.broadcast_to(anchor_matching_mask[None, :], (cost.shape[0],) + anchor_matching_mask.shape)
+                #                                            ).view(cost.shape[0], -1), axis=0)
                 # matching_matrix[:, anchor_matching_mask_idx] *= 0.0
                 matching_matrix *= 1 - anchor_matching_mask.astype(matching_matrix.dtype)
                 matching_matrix[cost_argmin, anchor_matching_mask_idx] = 1.0
@@ -2084,8 +2095,10 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
 
         for batch_idx in range(p[0].shape[0]):
             b_idx = (targets[:, 0] == batch_idx) # (n_tb,)
-            # this_target = ops.masked_select(targets, ops.tile(b_idx[:, None], (1, 6))).view(-1, 6) # (n_tb, 6)
-            this_target = ops.masked_select(targets, ops.broadcast_to(b_idx[:, None], b_idx.shape + (6,))).view(-1, 6)  # (n_tb, 6)
+            if b_idx.shape[0] == 0:
+                continue
+            this_target = ops.masked_select(targets, ops.tile(b_idx[:, None], (1, 6))).view(-1, 6) # (n_tb, 6)
+            # this_target = ops.masked_select(targets, ops.broadcast_to(b_idx[:, None], b_idx.shape + (6,))).view(-1, 6)  # (n_tb, 6)
             if this_target.shape[0] == 0:
                 continue
 
@@ -2108,10 +2121,12 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
                 b, a, gj, gi = b.view(-1), a.view(-1), gj.view(-1), gi.view(-1)
 
                 idx = (b == batch_idx) # (n_tp_b,)
+                if idx.sum() == 0:
+                    continue
                 b, a, gj, gi = ops.masked_select(b, idx), ops.masked_select(a, idx), \
                                ops.masked_select(gj, idx), ops.masked_select(gi, idx)
-                # _this_anch = ops.masked_select(anch[i], ops.tile(idx[:, None], (1, 2))).view(-1, 2) # (n_tp_b, 2)
-                _this_anch = ops.masked_select(anch[i], ops.broadcast_to(idx[:, None], idx.shape + (2,))).view(-1, 2)  # (n_tp_b, 2)
+                _this_anch = ops.masked_select(anch[i], ops.tile(idx[:, None], (1, 2))).view(-1, 2) # (n_tp_b, 2)
+                # _this_anch = ops.masked_select(anch[i], ops.broadcast_to(idx[:, None], idx.shape + (2,))).view(-1, 2)  # (n_tp_b, 2)
                 all_b += (b,)
                 all_a += (a,)
                 all_gj += (gj,)
@@ -2130,9 +2145,9 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
                 pxyxy = self.xywh2xyxy(pxywh)
                 pxyxys += (pxyxy,)
 
-            pxyxys = ops.concat(pxyxys, axis=0) # (n_tp, 4)
-            if pxyxys.shape[0] == 0:
+            if len(pxyxys) == 0:
                 continue
+            pxyxys = ops.concat(pxyxys, axis=0) # (n_tp, 4)
             p_obj = ops.concat(p_obj, axis=0) # (n_tp, 1)
             p_cls = ops.concat(p_cls, axis=0) # (n_tp, 80)
             from_which_layer = ops.concat(from_which_layer, axis=0)
@@ -2152,14 +2167,14 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
                                            depth=self.nc,
                                            on_value=ops.ones(1, pair_wise_iou.dtype),
                                            off_value=ops.zeros(1, pair_wise_iou.dtype)) # (n_tb, 80)
-            # gt_cls_per_image = ops.tile(gt_cls_per_image[:, None, :], (1, pxyxys.shape[0], 1)) # (n_tb, n_tp, 85)
-            gt_cls_per_image = ops.broadcast_to(gt_cls_per_image[:, None, :], (gt_cls_per_image.shape[0], pxyxys.shape[0], gt_cls_per_image.shape[1]))  # (n_tb, n_tp, 85)
+            gt_cls_per_image = ops.tile(gt_cls_per_image[:, None, :], (1, pxyxys.shape[0], 1)) # (n_tb, n_tp, 85)
+            # gt_cls_per_image = ops.broadcast_to(gt_cls_per_image[:, None, :], (gt_cls_per_image.shape[0], pxyxys.shape[0], gt_cls_per_image.shape[1]))  # (n_tb, n_tp, 85)
 
             num_gt = this_target.shape[0]
-            # cls_preds_ = ops.Sigmoid()(ops.tile(p_cls[None, :, :], (num_gt, 1, 1))) * \
-            #              ops.Sigmoid()(ops.tile(p_obj[None, :, :], (num_gt, 1, 1))) # (n_tb, n_tp, 80)
-            cls_preds_ = ops.Sigmoid()(ops.broadcast_to(p_cls[None, :, :], (num_gt,) + p_cls.shape)) * \
-                         ops.Sigmoid()(ops.broadcast_to(p_obj[None, :, :], (num_gt,) + p_obj.shape))  # (n_tb, n_tp, 80)
+            cls_preds_ = ops.Sigmoid()(ops.tile(p_cls[None, :, :], (num_gt, 1, 1))) * \
+                         ops.Sigmoid()(ops.tile(p_obj[None, :, :], (num_gt, 1, 1))) # (n_tb, n_tp, 80)
+            # cls_preds_ = ops.Sigmoid()(ops.broadcast_to(p_cls[None, :, :], (num_gt,) + p_cls.shape)) * \
+            #              ops.Sigmoid()(ops.broadcast_to(p_obj[None, :, :], (num_gt,) + p_obj.shape))  # (n_tb, n_tp, 80)
 
             y = ops.sqrt(cls_preds_)
             pair_wise_cls_loss = ops.binary_cross_entropy_with_logits(
@@ -2191,12 +2206,12 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
             anchor_matching_mask = anchor_matching_gt > 1  # (n_tp,)
             anchor_matching_mask_idx = ops.masked_select(mnp.arange(cost.shape[1]), anchor_matching_mask)
             if anchor_matching_mask.astype(cost.dtype).sum() > 0:
-                # cost_argmin = ops.argmin(ops.masked_select(cost,
-                #                                            ops.tile(anchor_matching_mask[None, :], (cost.shape[0], 1))
-                #                                            ).view(cost.shape[0], -1), axis=0)
                 cost_argmin = ops.argmin(ops.masked_select(cost,
-                                                           ops.broadcast_to(anchor_matching_mask[None, :], (cost.shape[0],) + anchor_matching_mask.shape)
+                                                           ops.tile(anchor_matching_mask[None, :], (cost.shape[0], 1))
                                                            ).view(cost.shape[0], -1), axis=0)
+                # cost_argmin = ops.argmin(ops.masked_select(cost,
+                #                                            ops.broadcast_to(anchor_matching_mask[None, :], (cost.shape[0],) + anchor_matching_mask.shape)
+                #                                            ).view(cost.shape[0], -1), axis=0)
                 # matching_matrix[:, anchor_matching_mask_idx] *= 0.0
                 matching_matrix *= 1 - anchor_matching_mask.astype(matching_matrix.dtype)
                 matching_matrix[cost_argmin, anchor_matching_mask_idx] = 1.0
@@ -2275,19 +2290,19 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
         targets = targets.view(-1, 6) # (bs, gt_max, 6) -> (bs*gt_max, 6)
         mask_t = targets[:, 1] >= 0 # (bs*gt_max,)
 
-        # targets = ops.masked_select(targets, ops.tile(mask_t[:, None], (1, 6))).view(-1, 6) # (nt, 6)
-        targets = ops.masked_select(targets, ops.broadcast_to(mask_t[:, None], mask_t.shape + (6,))).view(-1, 6)  # (nt, 6)
+        targets = ops.masked_select(targets, ops.tile(mask_t[:, None], (1, 6))).view(-1, 6) # (nt, 6)
+        # targets = ops.masked_select(targets, ops.broadcast_to(mask_t[:, None], mask_t.shape + (6,))).view(-1, 6)  # (nt, 6)
 
         na, nt = self.na, targets.shape[0]  # number of anchors, targets
         indices, anch, tmasks = (), (), ()
         gain = ops.ones(7, ms.int32)  # normalized to gridspace gain
 
-        # ai = ops.tile(mnp.arange(na, dtype=targets.dtype).view(na, 1), (1, nt)) # shape: (na, nt)
-        ai = ops.broadcast_to(mnp.arange(na, dtype=targets.dtype).view(na, 1), (na, nt))
+        ai = ops.tile(mnp.arange(na, dtype=targets.dtype).view(na, 1), (1, nt)) # shape: (na, nt)
+        # ai = ops.broadcast_to(mnp.arange(na, dtype=targets.dtype).view(na, 1), (na, nt))
 
         # (na, nt, 7)
-        # targets = ops.concat((ops.tile(targets[None, :, :], (na, 1, 1)), ai[:, :, None]), 2)  # append anchor indices # not support dynamic shape
-        targets = ops.concat((ops.broadcast_to(targets[None, :, :], (na,) + targets.shape[:]), ai[:, :, None]), 2) # append anchor indices
+        targets = ops.concat((ops.tile(targets[None, :, :], (na, 1, 1)), ai[:, :, None]), 2)  # append anchor indices # not support dynamic shape
+        # targets = ops.concat((ops.broadcast_to(targets[None, :, :], (na,) + targets.shape[:]), ai[:, :, None]), 2) # append anchor indices
 
         g = 0.5  # bias
         off = ops.cast(self._off, targets.dtype) * g  # offsets
@@ -2303,8 +2318,8 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
                 r = t[:, :, 4:6] / anchors[:, None, :]  # wh ratio # (na, nt, 2)
                 j = ops.maximum(r, 1. / r).max(2) < self.hyp_anchor_t  # compare # (na, nt)
 
-                # t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7) # (nm, 7)
-                t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm, 7)
+                t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7) # (nm, 7)
+                # t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm, 7)
 
                 # t = t[j]  # filter
 
@@ -2319,14 +2334,14 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
                 # original
                 j = ops.stack((ops.ones_like(j), j, k, l, m))  # shape: (5, nm)
 
-                # t = ops.tile(t, (5, 1, 1))  # shape(5, nm, 7)
-                # t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7)  # (nm_2, 7)
-                t = ops.broadcast_to(t, (5,) + t.shape)
-                t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm_2, 7)
+                t = ops.tile(t, (5, 1, 1))  # shape(5, nm, 7)
+                t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7)  # (nm_2, 7)
+                # t = ops.broadcast_to(t, (5,) + t.shape)
+                # t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm_2, 7)
 
                 offsets = ops.zeros_like(gxy)[None, :, :] + off[:, None, :] # (5, nm, 2)
-                # offsets = ops.masked_select(offsets, ops.tile(j[:, :, None], (1, 1, 2))).view(-1, 2)
-                offsets = ops.masked_select(offsets, ops.broadcast_to(j[:, :, None], j.shape + (2,))).view(-1, 2)
+                offsets = ops.masked_select(offsets, ops.tile(j[:, :, None], (1, 1, 2))).view(-1, 2)
+                # offsets = ops.masked_select(offsets, ops.broadcast_to(j[:, :, None], j.shape + (2,))).view(-1, 2)
             else:
                 t = targets[0]
                 offsets = 0
@@ -2354,19 +2369,19 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
         targets = targets.view(-1, 6) # (bs, gt_max, 6) -> (bs*gt_max, 6)
         mask_t = targets[:, 1] >= 0 # (bs*gt_max,)
 
-        # targets = ops.masked_select(targets, ops.tile(mask_t[:, None], (1, 6))).view(-1, 6) # (nt, 6)
-        targets = ops.masked_select(targets, ops.broadcast_to(mask_t[:, None], mask_t.shape + (6,))).view(-1, 6)  # (nt, 6)
+        targets = ops.masked_select(targets, ops.tile(mask_t[:, None], (1, 6))).view(-1, 6) # (nt, 6)
+        # targets = ops.masked_select(targets, ops.broadcast_to(mask_t[:, None], mask_t.shape + (6,))).view(-1, 6)  # (nt, 6)
 
         na, nt = self.na, targets.shape[0]  # number of anchors, targets
         indices, anch, tmasks = (), (), ()
         gain = ops.ones(7, ms.int32)  # normalized to gridspace gain
 
-        # ai = ops.tile(mnp.arange(na, dtype=targets.dtype).view(na, 1), (1, nt)) # shape: (na, nt)
-        ai = ops.broadcast_to(mnp.arange(na, dtype=targets.dtype).view(na, 1), (na, nt))
+        ai = ops.tile(mnp.arange(na, dtype=targets.dtype).view(na, 1), (1, nt)) # shape: (na, nt)
+        # ai = ops.broadcast_to(mnp.arange(na, dtype=targets.dtype).view(na, 1), (na, nt))
 
         # (na, nt, 7)
-        # targets = ops.concat((ops.tile(targets[None, :, :], (na, 1, 1)), ai[:, :, None]), 2)  # append anchor indices # not support dynamic shape
-        targets = ops.concat((ops.broadcast_to(targets[None, :, :], (na,) + targets.shape[:]), ai[:, :, None]), 2) # append anchor indices
+        targets = ops.concat((ops.tile(targets[None, :, :], (na, 1, 1)), ai[:, :, None]), 2)  # append anchor indices # not support dynamic shape
+        # targets = ops.concat((ops.broadcast_to(targets[None, :, :], (na,) + targets.shape[:]), ai[:, :, None]), 2) # append anchor indices
 
         g = 1.0  # bias
         off = ops.cast(self._off, targets.dtype) * g  # offsets
@@ -2382,8 +2397,8 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
                 r = t[:, :, 4:6] / anchors[:, None, :]  # wh ratio # (na, nt, 2)
                 j = ops.maximum(r, 1. / r).max(2) < self.hyp_anchor_t  # compare # (na, nt)
 
-                # t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7) # (nm, 7)
-                t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm, 7)
+                t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7) # (nm, 7)
+                # t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm, 7)
 
                 # t = t[j]  # filter
 
@@ -2398,14 +2413,14 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
                 # original
                 j = ops.stack((ops.ones_like(j), j, k, l, m))  # shape: (5, nm)
 
-                # t = ops.tile(t, (5, 1, 1))  # shape(5, nm, 7)
-                # t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7)  # (nm_2, 7)
-                t = ops.broadcast_to(t, (5,) + t.shape)
-                t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm_2, 7)
+                t = ops.tile(t, (5, 1, 1))  # shape(5, nm, 7)
+                t = ops.masked_select(t, ops.tile(j[:, :, None], (1, 1, 7))).view(-1, 7)  # (nm_2, 7)
+                # t = ops.broadcast_to(t, (5,) + t.shape)
+                # t = ops.masked_select(t, ops.broadcast_to(j[:, :, None], j.shape + (7,))).view(-1, 7)  # (nm_2, 7)
 
                 offsets = ops.zeros_like(gxy)[None, :, :] + off[:, None, :] # (5, nm, 2)
-                # offsets = ops.masked_select(offsets, ops.tile(j[:, :, None], (1, 1, 2))).view(-1, 2)
-                offsets = ops.masked_select(offsets, ops.broadcast_to(j[:, :, None], j.shape + (2,))).view(-1, 2)
+                offsets = ops.masked_select(offsets, ops.tile(j[:, :, None], (1, 1, 2))).view(-1, 2)
+                # offsets = ops.masked_select(offsets, ops.broadcast_to(j[:, :, None], j.shape + (2,))).view(-1, 2)
             else:
                 t = targets[0]
                 offsets = 0
