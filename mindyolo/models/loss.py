@@ -1393,9 +1393,7 @@ class ComputeLossOTA_dynamic(nn.Cell):
     def construct(self, p, targets, imgs):
         lcls, lbox, lobj = 0., 0., 0.
         bs, as_, gjs, gis, targets, anchors = self.build_targets(p, targets, imgs) # bs: (nl, bs*5*na*gt_max)
-        bs, as_, gjs, gis, targets, anchors = ops.stop_gradient(bs), ops.stop_gradient(as_), \
-                                              ops.stop_gradient(gjs), ops.stop_gradient(gis), \
-                                              ops.stop_gradient(targets), ops.stop_gradient(anchors)
+
         pre_gen_gains = ()
         for pp in p:
             pre_gen_gains += (get_tensor(pp.shape, pp.dtype)[[3, 2, 3, 2]],)
@@ -1741,7 +1739,7 @@ class ComputeLossOTA_dynamic(nn.Cell):
 class ComputeLossAuxOTA_dynamic(nn.Cell):
     # run with mindspore version 2.0.0
     def __init__(self, model, autobalance=False):
-        super(ComputeLossOTA_dynamic, self).__init__()
+        super(ComputeLossAuxOTA_dynamic, self).__init__()
         h = model.opt
         self.hyp_box = h.box
         self.hyp_obj = h.obj
@@ -1783,18 +1781,10 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
 
     def construct(self, p, targets, imgs):
         lcls, lbox, lobj = 0., 0., 0.
-        bs, as_, gjs, gis, targets, anchors = self.build_targets(p[:self.nl], targets, imgs) # bs: (nl, bs*5*na*gt_max)
-        bs_aux, as_aux_, gjs_aux, gis_aux, targets_aux, anchors_aux = self.build_targets2(p[:self.nl], targets, imgs)
+        targets_ori = targets
+        bs, as_, gjs, gis, targets, anchors = self.build_targets(p[:self.nl], targets_ori, imgs) # bs: (nl, bs*5*na*gt_max)
+        bs_aux, as_aux_, gjs_aux, gis_aux, targets_aux, anchors_aux = self.build_targets2(p[:self.nl], targets_ori, imgs)
 
-        bs, as_, gjs, gis, targets, anchors = ops.stop_gradient(bs), ops.stop_gradient(as_), \
-                                              ops.stop_gradient(gjs), ops.stop_gradient(gis), \
-                                              ops.stop_gradient(targets), ops.stop_gradient(anchors)
-        bs_aux, as_aux_, gjs_aux, gis_aux, targets_aux, anchors_aux = ops.stop_gradient(bs_aux),\
-                                                                      ops.stop_gradient(as_aux_), \
-                                                                      ops.stop_gradient(gjs_aux), \
-                                                                      ops.stop_gradient(gis_aux), \
-                                                                      ops.stop_gradient(targets_aux), \
-                                                                      ops.stop_gradient(anchors_aux)
         pre_gen_gains = ()
         pre_gen_gains_aux = ()
         for pp in p[:self.nl]:

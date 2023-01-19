@@ -24,7 +24,7 @@ def get_args_train(parents=None):
     parser.add_argument('--batch_size', type=int, default=32, help='total batch size for all device')
     parser.add_argument('--img_size', type=list, default=[640, 640], help='[train, test] image sizes')
     parser.add_argument('--run_eval', type=ast.literal_eval, default=False, help='run eval')
-    parser.add_argument('--log_interval', type=int, default=100, help='log interval')
+    parser.add_argument('--log_interval', type=int, default=1, help='log interval')
 
     parser.add_argument('--rect', type=ast.literal_eval, default=False, help='rectangular training')
     parser.add_argument('--nms_time_limit', type=float, default=10.0, help='time limit for NMS')

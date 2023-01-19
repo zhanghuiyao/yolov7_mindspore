@@ -98,7 +98,9 @@ def train(opt):
 
     # Optimizer
     nbs = 64  # nominal batch size
-    accumulate = max(round(nbs / total_batch_size), 1)  # accumulate loss before optimizing
+    # TEST: dynamic-shape
+    # accumulate = max(round(nbs / total_batch_size), 1)  # accumulate loss before optimizing
+    accumulate = 1
     opt.weight_decay *= total_batch_size * accumulate / nbs  # scale weight_decay
     print(f"Scaled weight_decay = {opt.weight_decay}")
     print(f"Accumulate step set is {accumulate}")
