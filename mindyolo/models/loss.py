@@ -1563,7 +1563,7 @@ class ComputeLossOTA_dynamic(nn.Cell):
             matching_matrix = ops.zeros_like(cost)
             for gt_idx in range(num_gt):
                 _, pos_idx = ops.top_k(
-                    cost[gt_idx], k=int(dynamic_ks[gt_idx].asnumpy())
+                    -cost[gt_idx], k=int(dynamic_ks[gt_idx].asnumpy())
                 )
                 matching_matrix[gt_idx][pos_idx] = 1.0
 
@@ -1983,7 +1983,7 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
             matching_matrix = ops.zeros_like(cost)
             for gt_idx in range(num_gt):
                 _, pos_idx = ops.top_k(
-                    cost[gt_idx], k=int(dynamic_ks[gt_idx].asnumpy())
+                    -cost[gt_idx], k=int(dynamic_ks[gt_idx].asnumpy())
                 )
                 matching_matrix[gt_idx][pos_idx] = 1.0
 
@@ -2181,7 +2181,7 @@ class ComputeLossAuxOTA_dynamic(nn.Cell):
             matching_matrix = ops.zeros_like(cost)
             for gt_idx in range(num_gt):
                 _, pos_idx = ops.top_k(
-                    cost[gt_idx], k=int(dynamic_ks[gt_idx].asnumpy())
+                    -cost[gt_idx], k=int(dynamic_ks[gt_idx].asnumpy())
                 )
                 matching_matrix[gt_idx][pos_idx] = 1.0
 
