@@ -1,4 +1,4 @@
-# Contents test
+# Contents
 
 - [YOLOv7 Description](#YOLOv7-description)
 - [Dataset](#dataset)
