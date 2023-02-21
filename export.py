@@ -60,5 +60,6 @@ def run_export(opt):
 
 
 if __name__ == '__main__':
-    opt = get_args_310()
+    parser = get_args_310()
+    opt = parser.parse_args()
     run_export(opt)

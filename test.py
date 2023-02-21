@@ -291,7 +291,8 @@ def test(data,
 
 
 if __name__ == '__main__':
-    opt = get_args_test()
+    parser = get_args_test()
+    opt = parser.parse_args()
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.data, opt.cfg, opt.hyp = check_file(opt.data), check_file(opt.cfg), check_file(opt.hyp)  # check files
     print(opt)

@@ -29,9 +29,9 @@ def get_args_train():
     parser.add_argument('--no_trace', action='store_true', help='don`t trace model')
     parser.add_argument('--transfer_format', type=ast.literal_eval, default=True,
                         help='whether transform data format to coco')
-    parser.add_argument('--cfg', type=str, default='./config/network_yolov7/yolov7.yaml', help='model.yaml path')
-    parser.add_argument('--data', type=str, default='./config/data/coco.yaml', help='data.yaml path')
-    parser.add_argument('--hyp', type=str, default='./config/data/hyp.scratch.p5.yaml', help='hyperparameters path')
+    parser.add_argument('--cfg', type=str, default='config/network_yolov7/yolov7.yaml', help='model.yaml path')
+    parser.add_argument('--data', type=str, default='config/data/coco.yaml', help='data.yaml path')
+    parser.add_argument('--hyp', type=str, default='config/data/hyp.scratch.p5.yaml', help='hyperparameters path')
     parser.add_argument('--profiler', type=ast.literal_eval, default=False, help='enable profiler')
     parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--batch_size', type=int, default=32, help='total batch size for all device')
@@ -39,15 +39,15 @@ def get_args_train():
     # args for evaluatation
     parser.add_argument('--run_eval', type=ast.literal_eval, default=True,
                         help='Whether do evaluation after some epoch')
-    parser.add_argument('--eval_start_epoch', type=int, default=2, help='Start epoch interval to do evaluation')
+    parser.add_argument('--eval_start_epoch', type=int, default=200, help='Start epoch interval to do evaluation')
     parser.add_argument('--eval_epoch_interval', type=int, default=10, help='Epoch interval to do evaluation')
     parser.add_argument('--conf_thres', type=float, default=0.001, help='object confidence threshold')
     parser.add_argument('--iou_thres', type=float, default=0.6, help='IOU threshold for NMS')
 
     parser.add_argument('--save_checkpoint', type=ast.literal_eval, default=True, help='save checkpoint')
-    parser.add_argument('--start_save_epoch', type=int, default=1, help='epoch to start save checkpoint')
-    parser.add_argument('--save_interval', type=int, default=1, help='the interval epoch of save checkpoint')
-    parser.add_argument('--max_ckpt_num', type=int, default=10,
+    parser.add_argument('--start_save_epoch', type=int, default=0, help='epoch to start save checkpoint')
+    parser.add_argument('--save_interval', type=int, default=5, help='the interval epoch of save checkpoint')
+    parser.add_argument('--max_ckpt_num', type=int, default=30,
                         help='the maximum number of save checkpoint, delete previous checkpoints if '
                              'the number of saved checkpoints are larger than this value')
 
@@ -93,8 +93,7 @@ def get_args_train():
     parser.add_argument('--data_url', type=str, default='', help='ModelArts: obs path to dataset folder')
     parser.add_argument('--train_url', type=str, default='', help='ModelArts: obs path to dataset folder')
     parser.add_argument('--data_dir', type=str, default='/cache/data/', help='ModelArts: obs path to dataset folder')
-    opt = parser.parse_args()
-    return opt
+    return parser
 
 
 def get_args_test():
@@ -102,9 +101,9 @@ def get_args_test():
     parser.add_argument('--ms_mode', type=str, default='graph', help='train mode, graph/pynative')
     parser.add_argument('--device_target', type=str, default='Ascend', help='device target, Ascend/GPU/CPU')
     parser.add_argument('--weights', type=str, default='yolov7_300.ckpt', help='model.ckpt path(s)')
-    parser.add_argument('--data', type=str, default='./config/data/coco.yaml', help='*.data path')
-    parser.add_argument('--cfg', type=str, default='./config/network_yolov7/yolov7.yaml', help='model.yaml path')
-    parser.add_argument('--hyp', type=str, default='./config/data/hyp.scratch.p5.yaml', help='hyperparameters path')
+    parser.add_argument('--data', type=str, default='config/data/coco.yaml', help='*.data path')
+    parser.add_argument('--cfg', type=str, default='config/network_yolov7/yolov7.yaml', help='model.yaml path')
+    parser.add_argument('--hyp', type=str, default='config/data/hyp.scratch.p5.yaml', help='hyperparameters path')
     parser.add_argument('--batch_size', type=int, default=32, help='size of each image batch')
     parser.add_argument('--img_size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--conf_thres', type=float, default=0.001, help='object confidence threshold')
@@ -112,6 +111,7 @@ def get_args_test():
     parser.add_argument('--task', default='val', help='train, val, test, speed or study')
     parser.add_argument('--single_cls', type=ast.literal_eval, default=False,
                         help='train multi-class data as single-class')
+    parser.add_argument('--rect', type=ast.literal_eval, default=False, help='rectangular test')
     parser.add_argument('--augment', type=ast.literal_eval, default=False, help='augmented inference')
     parser.add_argument('--verbose', type=ast.literal_eval, default=False, help='report mAP by class')
     parser.add_argument('--save_txt', type=ast.literal_eval, default=False, help='save results to *.txt')
@@ -132,8 +132,7 @@ def get_args_test():
     parser.add_argument('--result_view', type=ast.literal_eval, default=False, help='view the eval result')
     parser.add_argument('--recommend_threshold', type=ast.literal_eval, default=False,
                         help='recommend threshold in eval')
-    opt = parser.parse_args()
-    return opt
+    return parser
 
 
 def get_args_310():
@@ -143,9 +142,9 @@ def get_args_310():
     parser.add_argument('--ms_mode', type=str, default='graph', help='train mode, graph/pynative')
     parser.add_argument('--device_target', type=str, default='Ascend', help='device target, Ascend/GPU/CPU')
     parser.add_argument('--weights', type=str, default='yolov7_300.ckpt', help='model.ckpt path')
-    parser.add_argument('--data', type=str, default='./config/data/coco.yaml', help='*.data path')
-    parser.add_argument('--cfg', type=str, default='./config/network_yolov7/yolov7.yaml', help='model.yaml path')
-    parser.add_argument('--hyp', type=str, default='./config/data/hyp.scratch.p5.yaml', help='hyperparameters path')
+    parser.add_argument('--data', type=str, default='config/data/coco.yaml', help='*.data path')
+    parser.add_argument('--cfg', type=str, default='config/network_yolov7/yolov7.yaml', help='model.yaml path')
+    parser.add_argument('--hyp', type=str, default='config/data/hyp.scratch.p5.yaml', help='hyperparameters path')
     parser.add_argument('--per_batch_size', type=int, default=1, help='size of each image batch')
     parser.add_argument('--img_size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--file_format', type=str, default='MINDIR', help='treat as single-class dataset')
@@ -161,6 +160,4 @@ def get_args_310():
     parser.add_argument('--task', default='val', help='train, val, test, speed or study')
     parser.add_argument('--result_path', type=str, default='./result_Files', help='path to 310 infer result floder')
     parser.add_argument('--project', default='./run_test', help='save to project/name')
-
-    opt = parser.parse_args()
-    return opt
+    return parser

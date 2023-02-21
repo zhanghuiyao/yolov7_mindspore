@@ -1,7 +1,17 @@
-import mindspore as ms
-from mindspore import nn
 import math
 import numpy as np
+
+import mindspore as ms
+from mindspore import nn
+import mindspore.common.dtype as mstype
+from mindspore.common.tensor import Tensor
+from mindspore._checkparam import Validator
+from mindspore.common.api import ms_function
+from mindspore.common.parameter import Parameter
+from mindspore.common.parameter import ParameterTuple
+from mindspore.ops import functional as F, composite as C, operations as P
+from mindspore.nn.optim.optimizer import opt_init_args_register
+
 
 def one_cycle(y1=0.0, y2=1.0, steps=100):
     # lambda function for sinusoidal ramp from y1 to y2
@@ -104,6 +114,7 @@ def get_lr_yolov7(opt, hyp, per_epoch_size):
     warmup_bias_steps_first = min(max(round(3 * per_epoch_size), 1000), warmup_steps)
     warmup_bias_lr_first = np.interp(warmup_bias_steps_first, [0, warmup_steps], [0.0, init_lr])
     xi = [0, warmup_steps]
+    momentum_after_warmup = np.interp(warmup_steps, xi, [hyp['warmup_momentum'], hyp['momentum']])
     for i in range(total_epoch * per_epoch_size):
         cur_epoch = i // per_epoch_size
         _lr = init_lr * lf(cur_epoch)
@@ -119,6 +130,8 @@ def get_lr_yolov7(opt, hyp, per_epoch_size):
             lr_pg0.append(_lr)
             lr_pg1.append(_lr)
             lr_pg2.append(_lr)
+            if with_momentum:
+                momentum_pg.append(momentum_after_warmup)
 
     return lr_pg0, lr_pg1, lr_pg2, momentum_pg, warmup_steps
 
@@ -154,3 +167,94 @@ def get_thor_damping(global_step, damping_init, decay_rate, total_epochs, steps_
     damping_each_step = np.array(damping_each_step).astype(np.float32)
     damping_now = damping_each_step[current_step:]
     return damping_now
+
+
+_momentum_opt = C.MultitypeFuncGraph("momentum_opt")
+
+
+@_momentum_opt.register("Function", "Tensor", "Tensor", "Tensor", "Tensor", "Tensor", "Bool", "Bool")
+def _tensor_run_opt_ext(opt, momentum, learning_rate, gradient, weight, moment, ps_parameter, cache_enable):
+    """Apply momentum optimizer to the weight parameter using Tensor."""
+    if ps_parameter and not cache_enable:
+        op_shape = P.Shape()
+        _ps_pull = P.Pull()
+        _ps_push = P.Push("ApplyMomentum", [])
+        shapes = (op_shape(learning_rate), op_shape(gradient), op_shape(momentum))
+        success = F.depend(True, _ps_pull(_ps_push((learning_rate, gradient, momentum), shapes), weight))
+    else:
+        success = F.depend(True, opt(weight, moment, learning_rate, gradient, momentum))
+    return success
+
+
+@_momentum_opt.register("Function", "Tensor", "Tensor", "Tensor", "Tensor", "Tensor", "Bool", "Bool",
+                        "Function", "Bool")
+def _tensor_run_opt_ext_dist(opt, momentum, learning_rate, gradient, weight, moment, ps_parameter, cache_enable,
+                             distributed_opt, use_flag):
+    """Apply momentum optimizer to the weight parameter using Tensor."""
+    if use_flag:
+        success = F.depend(True, distributed_opt(weight, moment, learning_rate, gradient, momentum))
+    elif ps_parameter and not cache_enable:
+        op_shape = P.Shape()
+        _ps_pull = P.Pull()
+        _ps_push = P.Push("ApplyMomentum", [])
+        shapes = (op_shape(learning_rate), op_shape(gradient), op_shape(momentum))
+        success = F.depend(True, _ps_pull(_ps_push((learning_rate, gradient, momentum), shapes), weight))
+    else:
+        success = F.depend(True, opt(weight, moment, learning_rate, gradient, momentum))
+    return success
+
+
+class YoloMomentum(nn.Optimizer):
+    @opt_init_args_register
+    def __init__(self, params, learning_rate, momentum, weight_decay=0.0, loss_scale=1.0, use_nesterov=False):
+        super(YoloMomentum, self).__init__(learning_rate, params, weight_decay, loss_scale)
+        # Validator.check_value_type("momentum", momentum, [float], self.cls_name)
+        if isinstance(momentum, float) and momentum < 0.0:
+            raise ValueError("For 'Momentum', the argument 'momentum' must be at least 0.0, "
+                             "but got {}".format(momentum))
+        if isinstance(momentum, (float, int)):
+            self.momentum = Parameter(Tensor(momentum, mstype.float32), name="momentum")
+            self.list_moment = False
+        elif isinstance(momentum, (list, tuple)):
+            self.momentum = Parameter(np.array(momentum).astype(np.float32), name="momentum")
+            self.list_moment = True
+        self.params = self._parameters
+        self.use_nesterov = Validator.check_bool(use_nesterov)
+        self.moments = self.params.clone(prefix="moments", init='zeros')
+        self.opt = P.ApplyMomentum(use_nesterov=self.use_nesterov)
+
+        self.distributed_opts, self.use_distributed_opt_flags = \
+            self._get_distributed_optimizer_list("momentum", use_nesterov=self.use_nesterov)
+        self.use_dist_optimizer = self._use_distibuted_optimizer()
+        self.gather = P.Gather()
+
+    @ms_function
+    def construct(self, gradients):
+        params = self.params
+        moments = self.moments
+        if self.list_moment:
+            momentum = self.gather(self.momentum, self.global_step, 0)
+        else:
+            momentum = self.momentum
+        gradients = self.flatten_gradients(gradients)
+        gradients = self.decay_weight(gradients)
+        gradients = self.gradients_centralization(gradients)
+        gradients = self.scale_grad(gradients)
+        lr = self.get_lr()
+        if self.use_dist_optimizer:
+            if self.is_group_lr:
+                success = self.hyper_map_reverse(F.partial(_momentum_opt, self.opt, momentum),
+                                                 lr, gradients, params, moments, self.ps_parameters, self.cache_enable,
+                                                 self.distributed_opts, self.use_distributed_opt_flags)
+            else:
+                success = self.hyper_map_reverse(F.partial(_momentum_opt, self.opt, momentum, lr),
+                                                 gradients, params, moments, self.ps_parameters, self.cache_enable,
+                                                 self.distributed_opts, self.use_distributed_opt_flags)
+        else:
+            if self.is_group_lr:
+                success = self.hyper_map_reverse(F.partial(_momentum_opt, self.opt, momentum),
+                                                 lr, gradients, params, moments, self.ps_parameters, self.cache_enable)
+            else:
+                success = self.hyper_map_reverse(F.partial(_momentum_opt, self.opt, momentum, lr),
+                                                 gradients, params, moments, self.ps_parameters, self.cache_enable)
+        return success

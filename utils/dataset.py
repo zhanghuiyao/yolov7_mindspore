@@ -2,6 +2,7 @@ import glob
 import logging
 import math
 import os
+import cv2
 import random
 import hashlib
 import multiprocessing
@@ -95,8 +96,11 @@ class LoadImagesAndLabels:  # for training/testing
         cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')  # cached labels
         if cache_path.is_file():
             cache, exists = np.load(cache_path, allow_pickle=True).item(), True  # load dict
-            assert cache['version'] == self.cache_version  # matches current version
-            assert cache['hash'] == get_hash(self.label_files + self.img_files)  # identical hash
+            try:
+                assert cache['version'] == self.cache_version  # matches current version
+                assert cache['hash'] == get_hash(self.label_files + self.img_files)  # identical hash
+            except Exception as e:
+                exit(f"[ERROR] {e}, please remove cache file in dataset path: rm -f {Path(self.path).parent}/*.cache*")
         else:
             cache, exists = self.cache_labels(cache_path, prefix), False  # cache
 
@@ -328,7 +332,7 @@ class LoadImagesAndLabels:  # for training/testing
         img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
         img = np.ascontiguousarray(img)
 
-        return img, labels_out, self.img_files[index], shapes
+        return img.astype(np.float32), labels_out.astype(np.float32), self.img_files[index], shapes
 
     @staticmethod
     def collate_fn(img, label, path, shapes, batch_info):
@@ -362,15 +366,19 @@ class LoadImagesAndLabels:  # for training/testing
         for i, l in enumerate(label4):
             l[:, 0] = i  # add target image index for build_targets()
 
-        return np.stack(img4, 0), np.stack(label4, 0), path4, shapes4
+        return np.stack(img4, 0).astype(np.float32), np.stack(label4, 0).astype(np.float32), path4, shapes4
 
 
 def create_dataloader(path, imgsz, batch_size, stride, opt, epoch_size=300, hyp=None,
                       augment=False, cache=False, pad=0.0, rect=False, rank=0, rank_size=1,
                       num_parallel_workers=8, shuffle=True, drop_remainder=True,
-                      image_weights=False, quad=False, max_box_per_img=160, prefix=''):
+                      image_weights=False, quad=False, max_box_per_img=160, prefix='', model_train=False):
+    if rect and shuffle:
+        print('[WARNING] --rect is incompatible with DataLoader shuffle, setting shuffle=False', flush=True)
+        shuffle = False
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
-    dataset = LoadImagesAndLabels(path, imgsz, batch_size,
+    cv2.setNumThreads(2)
+    dataset = LoadImagesAndLabels(path, imgsz, batch_size * rank_size,
                                   augment=augment,  # augment images
                                   hyp=hyp,  # augmentation hyperparameters
                                   rect=rect,  # rectangular training
@@ -382,21 +390,27 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, epoch_size=300, hyp=
                                   max_box_per_img=max_box_per_img,
                                   prefix=prefix)
 
-    cores = multiprocessing.cpu_count()
-    num_parallel_workers = min(int(cores / rank_size), num_parallel_workers)
+    # cores = multiprocessing.cpu_count()
+    # num_parallel_workers = min(int(cores / rank_size), num_parallel_workers)
     dataset_column_names = ["img", "label_out", "img_files", "shapes"]
+    # de.config.set_prefetch_size(256)
+    print(f"[INFO] Num parallel workers: [{num_parallel_workers}]", flush=True)
     if rank_size > 1:
         ds = de.GeneratorDataset(dataset, column_names=dataset_column_names,
-                                 num_parallel_workers=min(8, num_parallel_workers), shuffle=shuffle,
+                                 num_parallel_workers=num_parallel_workers, shuffle=shuffle,
                                  num_shards=rank_size, shard_id=rank)
     else:
         ds = de.GeneratorDataset(dataset, column_names=dataset_column_names,
-                                 num_parallel_workers=min(32, num_parallel_workers), shuffle=shuffle)
+                                 num_parallel_workers=num_parallel_workers, shuffle=shuffle)
+    print(f"[INFO] Batch size: {batch_size}", flush=True)
     ds = ds.batch(batch_size,
                   per_batch_map=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn,
                   input_columns=dataset_column_names,
                   drop_remainder=drop_remainder)
-    ds = ds.repeat(epoch_size)
+    if model_train:
+        ds = ds.project(columns=["img", "label_out"])
+    else:
+        ds = ds.repeat(epoch_size)
 
     per_epoch_size = int(len(dataset) / batch_size / rank_size) if drop_remainder else \
         math.ceil(len(dataset) / batch_size / rank_size)

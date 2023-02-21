@@ -402,7 +402,8 @@ def create_train_static_shape_fn_gradoperation(model, optimizer, loss_scaler, gr
 
 
 if __name__ == '__main__':
-    opt = get_args_train()
+    parser = get_args_train()
+    opt = parser.parse_args()
     opt.data, opt.cfg, opt.hyp = check_file(opt.data), check_file(opt.cfg), check_file(opt.hyp)  # check files
     assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
     opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
