@@ -1,6 +1,6 @@
 import copy
 from collections import deque
-import sys
+
 import yaml
 import os
 import random
@@ -17,16 +17,15 @@ from mindspore.communication.management import init, get_rank, get_group_size
 from mindspore.ops import functional as F
 from mindspore.profiler.profiling import Profiler
 
-sys.path.append(os.path.join(os.path.abspath(os.path.dirname(__file__)), "yolov7"))
 from config.args import get_args_train
+from network.loss import ComputeLoss, ComputeLossOTA
 from network.yolo import Model
 from network.common import EMA
-from network.loss import ComputeLoss, ComputeLossOTA
-from utils.boost import build_train_network
-from utils.optimizer import get_group_param_yolov7, get_lr_yolov7, YoloMomentum
 from utils.dataset import create_dataloader
+from utils.boost import build_train_network
+from utils.optimizer import get_group_param, get_lr, YoloMomentum
 from utils.general import increment_path, colorstr, labels_to_class_weights, check_file, check_img_size
-from .test_v7 import test
+from test import test
 
 
 def set_seed(seed=2):
@@ -35,9 +34,73 @@ def set_seed(seed=2):
     ms.set_seed(seed)
 
 
-class Dict(dict):
-    __setattr__ = dict.__setitem__
-    __getattr__ = dict.__getitem__
+# clip grad define ----------------------------------------------------------------------------------
+clip_grad = ops.MultitypeFuncGraph("clip_grad")
+hyper_map = ops.HyperMap()
+GRADIENT_CLIP_TYPE = 1  # 0, ClipByValue; 1, ClipByNorm;
+GRADIENT_CLIP_VALUE = 10.0
+
+
+@clip_grad.register("Number", "Number", "Tensor")
+def _clip_grad(clip_type, clip_value, grad):
+    """
+        Clip gradients.
+
+        Inputs:
+            clip_type (int): The way to clip, 0 for 'value', 1 for 'norm'.
+            clip_value (float): Specifies how much to clip.
+            grad (tuple[Tensor]): Gradients.
+
+        Outputs:
+            tuple[Tensor]: clipped gradients.
+        """
+    if clip_type not in (0, 1):
+        return grad
+    dt = F.dtype(grad)
+    if clip_type == 0:
+        new_grad = ops.clip_by_value(grad, F.cast(F.tuple_to_array((-clip_value,)), dt),
+                                     F.cast(F.tuple_to_array((clip_value,)), dt))
+    else:
+        new_grad = nn.ClipByNorm()(grad, F.cast(F.tuple_to_array((clip_value,)), dt))
+    return new_grad
+
+
+# ----------------------------------------------------------------------------------------------------
+def detect_overflow(epoch, cur_step, grads):
+    for i in range(len(grads)):
+        tmp = grads[i].asnumpy()
+        if np.isinf(tmp).any() or np.isnan(tmp).any():
+            print(f"grad_{i}", flush=True)
+            print(f"Epoch: {epoch}, Step: {cur_step} grad_{i} overflow, this step drop. ", flush=True)
+            return True
+    return False
+
+
+def load_checkpoint_to_yolo(model, ckpt_path, resume):
+    trainable_params = {p.name: p.asnumpy() for p in model.get_parameters()}
+    param_dict = ms.load_checkpoint(ckpt_path)
+    new_params = {}
+    ema_prefix = "ema.ema."
+    for k, v in param_dict.items():
+        if not k.startswith("model.") and not k.startswith("updates") and not k.startswith(ema_prefix):
+            continue
+
+        k = k[len(ema_prefix):] if ema_prefix in k else k
+        if k in trainable_params:
+            if v.shape != trainable_params[k].shape:
+                print(f"[WARNING] Filter checkpoint parameter: {k}", flush=True)
+                continue
+            new_params[k] = v
+        else:
+            print(f"[WARNING] Checkpoint parameter: {k} not in model", flush=True)
+
+    ms.load_param_into_net(model, new_params)
+    print(f"load ckpt from \"{ckpt_path}\" success.", flush=True)
+    resume_epoch = 0
+    if resume and 'epoch' in param_dict:
+        resume_epoch = int(param_dict['epoch'])
+        print(f"[INFO] Resume training from epoch {resume_epoch}", flush=True)
+    return resume_epoch
 
 
 def create_train_network(model, use_ota, compute_loss, ema, optimizer, loss_scaler=None, sens=1.0, rank_size=1):
@@ -75,6 +138,51 @@ def create_train_network(model, use_ota, compute_loss, ema, optimizer, loss_scal
     return train_step
 
 
+def val(opt, model, ema, infer_model, val_dataloader, val_dataset, cur_epoch):
+    print("[INFO] Evaluating...", flush=True)
+    param_dict = {}
+    if opt.ema:
+        print("[INFO] ema parameter update", flush=True)
+        for p in ema.ema_weights:
+            name = p.name[len("ema."):]
+            param_dict[name] = p.data
+    else:
+        for p in model.get_parameters():
+            name = p.name
+            param_dict[name] = p.data
+
+    ms.load_param_into_net(infer_model, param_dict)
+    del param_dict
+    infer_model.set_train(False)
+    info, _, _ = test(opt.data,
+                      opt.weights,
+                      opt.batch_size,
+                      opt.img_size,
+                      opt.conf_thres,
+                      opt.iou_thres,
+                      opt.save_json,
+                      opt.single_cls,
+                      opt.augment,
+                      opt.verbose,
+                      model=infer_model,
+                      dataloader=val_dataloader,
+                      dataset=val_dataset,
+                      save_txt=opt.save_txt | opt.save_hybrid,
+                      save_hybrid=opt.save_hybrid,
+                      save_conf=opt.save_conf,
+                      trace=not opt.no_trace,
+                      plots=False,
+                      half_precision=False,
+                      v5_metric=opt.v5_metric,
+                      is_distributed=opt.is_distributed,
+                      rank=opt.rank,
+                      rank_size=opt.rank_size,
+                      opt=opt,
+                      cur_epoch=cur_epoch)
+    infer_model.set_train(True)
+    return info
+
+
 def save_ema(ema, ema_ckpt_path, append_dict=None):
     params_list = []
     for p in ema.ema_weights:
@@ -95,16 +203,18 @@ class CheckpointQueue:
             os.remove(ckpt_to_delete)
 
 
-def train(opt, data_dict, hyp, fn_dict):
+def train(hyp, opt):
     set_seed()
-    fn_dict = Dict(fn_dict)
     if opt.enable_modelarts:
+        from utils.modelarts import sync_data
         os.makedirs(opt.data_dir, exist_ok=True)
-        fn_dict.sync_data(opt.data_url, opt.data_dir, opt.enable_modelarts)
+        sync_data(opt.data_url, opt.data_dir)
 
     save_dir, epochs, batch_size, total_batch_size, weights, rank, freeze = \
         opt.save_dir, opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.rank, opt.freeze
 
+    with open(opt.data) as f:
+        data_dict = yaml.load(f, Loader=yaml.SafeLoader)  # data dict
     nc = 1 if opt.single_cls else int(data_dict['nc'])  # number of classes
     names = ['item'] if opt.single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
     assert len(names) == nc, '%g names found for nc=%g dataset in %s' % (len(names), nc, opt.data)  # check
@@ -119,17 +229,32 @@ def train(opt, data_dict, hyp, fn_dict):
     os.makedirs(wdir, exist_ok=True)
     # Save run settings
     with open(os.path.join(save_dir, "hyp.yaml"), 'w') as f:
-        yaml.dump(dict(hyp), f, sort_keys=False)
+        yaml.dump(hyp, f, sort_keys=False)
     with open(os.path.join(save_dir, "opt.yaml"), 'w') as f:
         yaml.dump(vars(opt), f, sort_keys=False)
-    fn_dict.sync_data(save_dir, opt.train_url, opt.enable_modelarts)
+    if opt.enable_modelarts:
+        sync_data(save_dir, opt.train_url)
 
     # Model
-    sync_bn = opt.sync_bn and context.get_context("device_target") == "Ascend" and opt.rank_size > 1
+    sync_bn = opt.sync_bn and context.get_context("device_target") == "Ascend" and rank_size > 1
     model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors'), sync_bn=sync_bn, opt=opt)  # create
     model.to_float(ms.float16)
     ema = EMA(model) if opt.ema else None
-    model, resume_epoch = fn_dict.restore_freeze_fn(model, ema, opt, weights, freeze)
+
+    pretrained = weights.endswith('.ckpt')
+    resume_epoch = 0
+    if pretrained:
+        resume_epoch = load_checkpoint_to_yolo(model, weights, opt.resume)
+        ema.clone_from_model()
+        print("ema_weight not exist, default pretrain weight is currently used.")
+
+    # Freeze
+    freeze = [f'model.{x}.' for x in
+              (freeze if len(freeze) > 1 else range(freeze[0]))]  # parameter names to freeze (full or partial)
+    for n, p in model.parameters_and_names():
+        if any(x in n for x in freeze):
+            print('freezing %s' % n)
+            p.requires_grad = False
 
     # Image sizes
     gs = max(int(model.stride.asnumpy().max()), 32)  # grid size (max stride)
@@ -150,12 +275,11 @@ def train(opt, data_dict, hyp, fn_dict):
         rect = False
         val_dataloader, val_dataset, _ = create_dataloader(test_path, imgsz, batch_size, gs, opt,
                                                            epoch_size=1, pad=0.5, rect=rect,
-                                                           rank=rank, rank_size=opt.rank_size,
-                                                           num_parallel_workers=4 if opt.rank_size > 1 else 8,
+                                                           rank=rank, rank_size=rank_size,
+                                                           num_parallel_workers=4 if rank_size > 1 else 8,
                                                            shuffle=False,
                                                            drop_remainder=False,
                                                            prefix=colorstr(f'val: '))
-
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
 
@@ -167,12 +291,12 @@ def train(opt, data_dict, hyp, fn_dict):
     hyp['weight_decay'] *= total_batch_size * accumulate / nbs  # scale weight_decay
     print(f"Scaled weight_decay = {hyp['weight_decay']}")
 
-    pg0, pg1, pg2 = get_group_param_yolov7(model)
-    lr_pg0, lr_pg1, lr_pg2, momentum_pg, warmup_steps = get_lr_yolov7(opt, hyp, per_epoch_size)
-
+    pg0, pg1, pg2 = get_group_param(model)
+    lr_pg0, lr_pg1, lr_pg2, momentum_pg, warmup_steps = get_lr(opt, hyp, per_epoch_size)
     group_params = [{'params': pg0, 'lr': lr_pg0},
                     {'params': pg1, 'lr': lr_pg1, 'weight_decay': hyp['weight_decay']},
                     {'params': pg2, 'lr': lr_pg2}]
+
     print(f"optimizer loss scale is {opt.ms_optim_loss_scale}")
     if opt.optimizer == "sgd":
         optimizer = nn.SGD(group_params, learning_rate=hyp['lr0'], momentum=hyp['momentum'], nesterov=True,
@@ -247,15 +371,67 @@ def train(opt, data_dict, hyp, fn_dict):
         if opt.profiler and (cur_epoch == run_profiler_epoch):
             break
 
-        fn_dict.save_ckpt_fn(model, ema, ckpt_queue, ema_ckpt_queue, save_ema,
-                             opt, cur_epoch, rank, wdir, fn_dict.sync_data)
-        fn_dict.run_eval_fn(opt, data_dict, hyp, model, ema, infer_model, val_dataloader, val_dataset,
-                            cur_epoch, rank, best_map, wdir, fn_dict.sync_data)
+        def is_save_epoch():
+            return (cur_epoch >= opt.start_save_epoch) and (cur_epoch % opt.save_interval == 0)
 
+        if opt.save_checkpoint and (rank % 8 == 0) and is_save_epoch():
+            # Save Checkpoint
+            model_name = os.path.basename(opt.cfg)[:-5]  # delete ".yaml"
+            ckpt_path = os.path.join(wdir, f"{model_name}_{cur_epoch}.ckpt")
+            ms.save_checkpoint(model, ckpt_path, append_dict={"epoch": cur_epoch})
+            ckpt_queue.append(ckpt_path)
+            if ema:
+                ema_ckpt_path = os.path.join(wdir, f"EMA_{model_name}_{cur_epoch}.ckpt")
+                append_dict = {"updates": ema.updates, "epoch": cur_epoch}
+                save_ema(ema, ema_ckpt_path, append_dict)
+                ema_ckpt_queue.append(ema_ckpt_path)
+                print("save ckpt path:", ema_ckpt_path, flush=True)
+            if opt.enable_modelarts:
+                sync_data(ckpt_path, opt.train_url + "/weights/" + ckpt_path.split("/")[-1])
+                if ema:
+                    sync_data(ema_ckpt_path, opt.train_url + "/weights/" + ema_ckpt_path.split("/")[-1])
+
+        # Evaluation
+        def is_eval_epoch():
+            return cur_epoch == opt.eval_start_epoch or \
+                   ((cur_epoch >= opt.eval_start_epoch) and (cur_epoch % opt.eval_epoch_interval) == 0)
+
+        if opt.run_eval and is_eval_epoch():
+            eval_results = val(opt, model, ema, infer_model, val_dataloader, val_dataset, cur_epoch=cur_epoch)
+            mean_ap = eval_results[3]
+            if (rank % 8 == 0) and (mean_ap > best_map):
+                best_map = mean_ap
+                print(f"[INFO] Best result: Best mAP [{best_map}] at epoch [{cur_epoch}]", flush=True)
+                # save best checkpoint
+                model_name = Path(opt.cfg).stem  # delete ".yaml"
+                ckpt_path = os.path.join(wdir, f"{model_name}_best.ckpt")
+                ms.save_checkpoint(model, ckpt_path, append_dict={"epoch": cur_epoch})
+                if ema:
+                    ema_ckpt_path = os.path.join(wdir, f"EMA_{model_name}_best.ckpt")
+                    append_dict = {"updates": ema.updates, "epoch": cur_epoch}
+                    save_ema(ema, ema_ckpt_path, append_dict)
+                if opt.enable_modelarts:
+                    sync_data(ckpt_path, opt.train_url + "/weights/" + ckpt_path.split("/")[-1])
+                    if ema:
+                        sync_data(ema_ckpt_path, opt.train_url + "/weights/" + ema_ckpt_path.split("/")[-1])
+                map_str_path = os.path.join(wdir, f"{model_name}_{cur_epoch}_map.txt")
+                coco_map_table_str = eval_results[-1]
+                with open(map_str_path, 'w') as file:
+                    file.write(f"COCO API:\n{coco_map_table_str}\n")
     return 0
 
 
-def context_init(opt):
+if __name__ == '__main__':
+    parser = get_args_train()
+    opt = parser.parse_args()
+    opt.save_json |= opt.data.endswith('coco.yaml')
+    # opt.hyp = opt.hyp or ('hyp.finetune.yaml' if opt.weights else 'hyp.scratch.yaml')
+    opt.data, opt.cfg, opt.hyp = check_file(opt.data), check_file(opt.cfg), check_file(opt.hyp)  # check files
+    assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
+    opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
+    opt.name = 'evolve' if opt.evolve else opt.name
+    opt.save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok | opt.evolve)  # increment run
+
     ms_mode = context.GRAPH_MODE if opt.ms_mode == "graph" else context.PYNATIVE_MODE
     context.set_context(mode=ms_mode, device_target=opt.device_target, save_graphs=False)
     if opt.device_target == "Ascend":
@@ -266,33 +442,7 @@ def context_init(opt):
     if opt.is_distributed:
         init()
         rank, rank_size, parallel_mode = get_rank(), get_group_size(), ParallelMode.DATA_PARALLEL
-    context.set_auto_parallel_context(parallel_mode=parallel_mode, gradients_mean=True, device_num=rank_size)
-    return rank, rank_size
-
-
-def parse_config(local=False, config_fn=None):
-    parse = get_args_train()
-    # Hyperparameters
-    opt, data_dict, hyp = None, None, None
-    if config_fn is not None and config_fn(parse) is not None:
-        opt, data_dict, hyp = config_fn(parse)
-    # opt.hyp = opt.hyp or ('hyp.finetune.yaml' if opt.weights else 'hyp.scratch.yaml')
-    assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
-    opt.is_coco = opt.data.endswith('coco.yaml')
-    opt.save_json |= opt.data.endswith('coco.yaml')
-    opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
-    opt.name = 'evolve' if opt.evolve else opt.name
-    if local:
-        rank, rank_size = context_init(opt)
-    else:
-        rank = 0 if not opt.is_distributed else get_rank()
-        rank_size = 1 if not opt.is_distributed else get_group_size()
-
-    opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
-
-    if local:
-        opt.name = 'evolve' if opt.evolve else opt.name
-        opt.save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok | opt.evolve)  # increment run
+        context.set_auto_parallel_context(parallel_mode=parallel_mode, gradients_mean=True, device_num=rank_size, all_reduce_fusion_config=[10, 70, 130, 190, 250, 310])
 
     opt.total_batch_size = opt.batch_size
     opt.rank_size = rank_size
@@ -300,4 +450,20 @@ def parse_config(local=False, config_fn=None):
     if rank_size > 1:
         assert opt.batch_size % opt.rank_size == 0, '--batch-size must be multiple of device count'
         opt.batch_size = opt.total_batch_size // opt.rank_size
-    return opt, data_dict, hyp
+
+    # Hyperparameters
+    with open(opt.hyp) as f:
+        hyp = yaml.load(f, Loader=yaml.SafeLoader)  # load hyps
+    # Train
+    profiler = None
+    if opt.profiler:
+        profiler = Profiler()
+
+    if not opt.evolve:
+        print(f"[INFO] OPT: {opt}")
+        train(hyp, opt)
+    else:
+        raise NotImplementedError("Not support evolve train;")
+
+    if opt.profiler:
+        profiler.analyse()

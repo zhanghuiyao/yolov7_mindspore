@@ -1,5 +1,4 @@
 import io
-import sys
 import glob
 import os
 import time
@@ -9,23 +8,60 @@ import codecs
 from pathlib import Path
 from threading import Thread
 from contextlib import redirect_stdout
+
 import numpy as np
+from pycocotools.coco import COCO
+
+try:
+    from third_party.fast_coco.fast_coco_eval_api import Fast_COCOeval as COCOeval
+
+    print("[INFO] Use third party coco eval api to speed up mAP calculation.")
+except ImportError:
+    from pycocotools.cocoeval import COCOeval
+
+    print("[INFO] Third party coco eval api import failed, use default api.")
+
 import mindspore as ms
 from mindspore.context import ParallelMode
 from mindspore import context, Tensor, ops
 from mindspore.communication.management import init, get_rank, get_group_size
-sys.path.append(os.path.join(os.path.abspath(os.path.dirname(__file__)), "yolov7"))
+
 from network.yolo import Model
 from config.args import get_args_test
 from utils.general import coco80_to_coco91_class, check_file, check_img_size, xyxy2xywh, xywh2xyxy, \
-    colorstr, box_iou
+    colorstr, box_iou, Synchronize, increment_path
 from utils.dataset import create_dataloader
 from utils.metrics import ConfusionMatrix, non_max_suppression, scale_coords, ap_per_class
 from utils.plots import plot_study_txt, plot_images, output_to_target
+from third_party.yolo2coco.yolo2coco import YOLO2COCO
+
 
 class Dict(dict):
     __setattr__ = dict.__setitem__
     __getattr__ = dict.__getitem__
+
+
+def save_one_json(predn, jdict, path, class_map):
+    # Save one JSON result {"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}
+    image_id = int(path.stem) if path.stem.isnumeric() else path.stem
+    box = xyxy2xywh(predn[:, :4])  # xywh
+    box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
+    for p, b in zip(predn.tolist(), box.tolist()):
+        jdict.append({
+            'image_id': image_id,
+            'category_id': class_map[int(p[5])],
+            'bbox': [round(x, 3) for x in b],
+            'score': round(p[4], 5)})
+
+
+def save_one_txt(predn, save_conf, shape, file):
+    # Save one txt result
+    gn = np.array(shape)[[1, 0, 1, 0]]  # normalization gain whwh
+    for *xyxy, conf, cls in predn.tolist():
+        xywh = (xyxy2xywh(np.array(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
+        line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
+        with open(file, 'a') as f:
+            f.write(('%g ' * len(line)).rstrip() % line + '\n')
 
 
 def process_batch(detections, labels, iouv):
@@ -53,8 +89,94 @@ def process_batch(detections, labels, iouv):
     return np.array(correct).astype(np.bool_)
 
 
-def test(data_dict,
-         hyp,
+def load_checkpoint_to_yolo(model, ckpt_path):
+    param_dict = ms.load_checkpoint(ckpt_path)
+    new_params = {}
+    for k, v in param_dict.items():
+        if k.startswith("model.") or k.startswith("updates"):
+            new_params[k] = v
+        if k.startswith("ema.ema."):
+            k = k[len("ema.ema."):]
+            new_params[k] = v
+    ms.load_param_into_net(model, new_params)
+    print(f"load ckpt from \"{ckpt_path}\" success.", flush=True)
+
+
+def compute_metrics(plots, save_dir, names, nc, seen, stats, verbose, training):
+    # Compute metrics
+    p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
+    ap, ap_class = [], []
+    stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
+    if len(stats) and stats[0].any():
+        tp, fp, p, r, f1, ap, ap_class = ap_per_class(*stats, plot=plots, save_dir=save_dir, names=names)
+        ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
+        mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
+    nt = np.bincount(stats[3].astype(int), minlength=nc)  # number of targets per class
+
+    # Print results
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        title = ('%22s' + '%11s' * 6) % ('Class', 'Images', 'Instances', 'P', 'R', 'mAP50', 'mAP50-95')
+        pf = '%20s' + '%12i' * 2 + '%12.3g' * 4  # print format
+        print(title)
+        print(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
+
+        # Print results per class
+        if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
+            for i, c in enumerate(ap_class):
+                # Class     Images  Instances          P          R      mAP50   mAP50-95:
+                print(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i]))
+    map_str = buffer.getvalue()
+    print(map_str, flush=True)
+    return map_str
+
+
+def coco_eval(anno_json, pred_json, dataset, is_coco):
+    anno = COCO(anno_json)  # init annotations api
+    pred = anno.loadRes(pred_json)  # init predictions api
+    eval = COCOeval(anno, pred, 'bbox')
+    if is_coco:
+        eval.params.imgIds = [int(Path(x).stem) for x in dataset.img_files]  # image IDs to evaluate
+    eval.evaluate()
+    eval.accumulate()
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        eval.summarize()
+    map, map50 = eval.stats[:2]  # update results (mAP@0.5:0.95, mAP@0.5)
+    return map, map50, buffer.getvalue()
+
+
+def merge_json(project_dir, prefix):
+    merged_json = os.path.join(project_dir, f"{prefix}_predictions_merged.json")
+    merged_result = []
+    for json_file in Path(project_dir).rglob("*.json"):
+        print(f"[INFO] Merge json file {json_file.resolve()}", flush=True)
+        with open(json_file, "r") as file_handler:
+            merged_result.extend(json.load(file_handler))
+    with open(merged_json, "w") as file_handler:
+        json.dump(merged_result, file_handler)
+    print(f"[INFO] Write merged results to file {merged_json} successfully.", flush=True)
+    return merged_json, merged_result
+
+
+def view_result(anno_json, result_json, val_path, score_threshold=None, recommend_threshold=False):
+    from src.coco_visual import CocoVisualUtil
+    dataset_coco = COCO(anno_json)
+    coco_visual = CocoVisualUtil()
+    eval_types = ["bbox"]
+    config = {"dataset": "coco"}
+    data_dir = Path(val_path).parent
+    img_path_name = os.path.splitext(os.path.basename(val_path))[0]
+    im_path_dir = os.path.join(data_dir, "images", img_path_name)
+    config = Dict(config)
+    with open(result_json,'r') as f:
+        result = json.load(f)
+    result_files = coco_visual.results2json(dataset_coco, result, "./results.pkl")
+    coco_visual.coco_eval(config, result_files, eval_types, dataset_coco, im_path_dir=im_path_dir,
+                          score_threshold=score_threshold, recommend_threshold=recommend_threshold)
+
+
+def test(data,
          weights=None,
          batch_size=32,
          imgsz=640,
@@ -82,25 +204,30 @@ def test(data_dict,
          rank=0,
          rank_size=1,
          opt=None,
-         cur_epoch=0,
-         fn_dict=None):
-    fn_dict = Dict(fn_dict)
-    nc = 1 if single_cls else int(data_dict['nc'])  # number of classes
+         cur_epoch=0):
+    # Configure
+    if isinstance(data, str):
+        is_coco = data.endswith('coco.yaml')
+        with open(data) as f:
+            data = yaml.load(f, Loader=yaml.SafeLoader)
+    nc = 1 if single_cls else int(data['nc'])  # number of classes
     iouv = np.linspace(0.5, 0.95, 10)  # iou vector for mAP@0.5:0.95
     niou = np.prod(iouv.shape)
-    synchronize = fn_dict.Synchronize(rank_size) if is_distributed else None
-    is_training = model is not None
-    project_dir = os.path.join(opt.project, "eval", f"epoch_{cur_epoch}") if is_training else opt.project
-    save_dir = os.path.join(project_dir, f"rank_{rank}") if rank_size > 1 else project_dir
-    os.makedirs(os.path.join(save_dir, f"labels"), exist_ok=opt.exist_ok)
+    synchronize = Synchronize(rank_size) if is_distributed else None
+    project_dir = os.path.join(opt.project, f"epoch_{cur_epoch}")
+    save_dir = os.path.join(project_dir, f"save_dir_{rank}")
+    save_dir = increment_path(save_dir, exist_ok=opt.exist_ok)
+    os.makedirs(os.path.join(save_dir, f"labels_{rank}"), exist_ok=opt.exist_ok)
     # Initialize/load model and set device
-
+    is_training = model is not None
     if model is None:  # called by train.py
         # Load model
         # Hyperparameters
+        with open(opt.hyp) as f:
+            hyp = yaml.load(f, Loader=yaml.SafeLoader)  # load hyps
         model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors'), sync_bn=False)  # create
         ckpt_path = weights
-        fn_dict.load_checkpoint_to_yolo(model, ckpt_path)
+        load_checkpoint_to_yolo(model, ckpt_path)
         gs = max(int(ops.cast(model.stride, ms.float16).max()), 32)  # grid size (max stride)
         imgsz = check_img_size(imgsz, s=gs)  # check img_size
 
@@ -118,11 +245,11 @@ def test(data_dict,
     if dataloader is None or dataset is None:
         print("[INFO] enable rect", rect, flush=True)
         task = opt.task if opt.task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
-        dataloader, dataset, per_epoch_size = create_dataloader(data_dict[task], imgsz, batch_size, gs, opt,
+        dataloader, dataset, per_epoch_size = create_dataloader(data[task], imgsz, batch_size, gs, opt,
                                                                 epoch_size=1, pad=0.5, rect=rect,
                                                                 rank=rank,
                                                                 rank_size=rank_size,
-                                                                num_parallel_workers=4 if rank_size > 1 else 8,
+                                                                num_parallel_workers=8,
                                                                 shuffle=False,
                                                                 drop_remainder=False,
                                                                 prefix=colorstr(f'{task}: '))
@@ -143,7 +270,7 @@ def test(data_dict,
     names = {k: v for k, v in enumerate(model.names if hasattr(model, 'names') else model.module.names)}
 
     start_idx = 1
-    class_map = fn_dict.coco80_to_coco91_class() if is_coco else list(range(start_idx, 1000 + start_idx))
+    class_map = coco80_to_coco91_class() if is_coco else list(range(start_idx, 1000 + start_idx))
     p, r, f1, mp, mr, map50, map, t0, t1, t2 = 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.
     map_table_str = ''
     loss = np.zeros(3)
@@ -181,12 +308,12 @@ def test(data_dict,
         targets[:, 2:] *= np.array([width, height, width, height], targets.dtype)  # to pixels
         lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
         t = time.time()
-        out = fn_dict.non_max_suppression(pred_out.asnumpy(),
-                                          conf_thres,
-                                          iou_thres,
-                                          labels=lb,
-                                          multi_label=True,
-                                          agnostic=single_cls)
+        out = non_max_suppression(pred_out.asnumpy(),
+                                  conf_thres,
+                                  iou_thres,
+                                  labels=lb,
+                                  multi_label=True,
+                                  agnostic=single_cls)
         nms_time = time.time() - t
         t1 += nms_time
 
@@ -195,34 +322,45 @@ def test(data_dict,
         for si, pred in enumerate(out):
             labels = targets[targets[:, 0] == si, 1:]
             nl, npr, shape = labels.shape[0], pred.shape[0], shapes[si][0]  # number of labels, predictions
-            tcls = labels[:, 0].tolist() if nl else []  # target class
             if type(paths[si]) is np.ndarray or type(paths[si]) is np.bytes_:
                 path = Path(str(codecs.decode(paths[si].tostring()).strip(b'\x00'.decode())))
             else:
-                path = Path(paths[si])
-            correct = np.zeros((npr, niou)).astype(np.bool_)  # init
+                path = Path(str(paths[si]))
+            tcls = labels[:, 0].tolist() if nl else []
             seen += 1
 
-            if npr == 0:
+            if len(pred) == 0:
                 if nl:
                     stats.append((np.zeros((0, niou), dtype=np.bool),
                                   np.zeros(0, dtype=pred.dtype),
                                   np.zeros(0, dtype=pred.dtype),
                                   tcls))
-
                 continue
 
             # Predictions
             predn = np.copy(pred)
-            predn[:, :4] = scale_coords(img[si].shape[1:], predn[:, :4], shapes[si][0, :], shapes[si][1:, :])  # native-space pred
+            scale_coords(img[si].shape[1:], predn[:, :4], shapes[si][0, :], shapes[si][1:, :])  # native-space pred
 
             # Append to text file
             if save_txt:
-                fn_dict.save_one_txt(predn, save_conf, shape, file=os.path.join(save_dir, 'labels', f'{path.stem}.txt'))
+                gn = np.array(shapes[si][0])[[1, 0, 1, 0]]  # normalization gain whwh
+                for *xyxy, conf, cls in predn.tolist():
+                    xywh = (xyxy2xywh(np.array(xyxy).reshape((1, 4))) / gn).reshape(-1).tolist()  # normalized xywh
+                    line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
+                    with open(os.path.join(save_dir, 'labels', (path.stem + '.txt')), 'a') as f:
+                        f.write(('%g ' * len(line)).rstrip() % line + '\n')
 
             # Append to pycocotools JSON dictionary
             if save_json:
-                fn_dict.save_one_json(predn, jdict, path, class_map, is_coco)  # append to COCO-JSON dictionary
+                # [{"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}, ...
+                image_id = int(path.stem) if path.stem.isnumeric() else path.stem
+                box = xyxy2xywh(predn[:, :4])  # xywh
+                box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
+                for p, b in zip(pred.tolist(), box.tolist()):
+                    jdict.append({'image_id': image_id,
+                                  'category_id': class_map[int(p[5])] if is_coco else int(p[5]),
+                                  'bbox': [round(x, 3) for x in b],
+                                  'score': round(p[4], 5)})
 
             # Assign all predictions as incorrect
             correct = np.zeros((pred.shape[0], niou), dtype=np.bool)
@@ -265,9 +403,9 @@ def test(data_dict,
         t2 += metric_time
         # Plot images
         if plots and batch_i < 3:
-            f = os.path.join(save_dir, f'test_batch{batch_i}_labels.jpg')  # labels
+            f = os.path.join(save_dir, f'test_batch{batch_i}_labels.jpg') # labels
             Thread(target=plot_images, args=(img, targets, paths, f, names), daemon=True).start()
-            f = os.path.join(save_dir, f'test_batch{batch_i}_pred.jpg')  # predictions
+            f = os.path.join(save_dir, f'test_batch{batch_i}_pred.jpg') # predictions
             Thread(target=plot_images, args=(img, output_to_target(out), paths, f, names), daemon=True).start()
 
         print(f"Test step: {batch_i + 1}/{per_epoch_size}: cost time [{(time.time() - s_time) * 1e3:.2f}]ms "
@@ -276,7 +414,7 @@ def test(data_dict,
               f"Metric time: [{metric_time * 1e3:.2f}]ms", flush=True)
         s_time = time.time()
 
-    # fn_dict.compute_metrics(plots, save_dir, names, nc, seen, stats, verbose, training)
+    # compute_metrics(plots, save_dir, names, nc, seen, stats, verbose, training)
 
     # Print speeds
     total_time = (t0, t1, t2, t0 + t1 + t2, imgsz, imgsz, batch_size)  # tuple
@@ -292,14 +430,14 @@ def test(data_dict,
     # Save JSON
     if save_json and len(jdict):
         w = Path(weights).stem if weights is not None else ''  # weights
-        data_dir = Path(data_dict["val"]).parent
+        data_dir = Path(data["val"]).parent
         anno_json = os.path.join(data_dir, "annotations/instances_val2017.json")
         if opt.transfer_format and not os.path.exists(
                 anno_json):  # data format transfer if annotations does not exists
             print("[INFO] Transfer annotations from yolo to coco format.")
-            transformer = fn_dict.YOLO2COCO(data_dir, output_dir=data_dir,
-                                            class_names=data_dict["names"], class_map=class_map,
-                                            mode='val', annotation_only=True)
+            transformer = YOLO2COCO(data_dir, output_dir=data_dir,
+                                    class_names=data["names"], class_map=class_map,
+                                    mode='val', annotation_only=True)
             transformer()
         pred_json = os.path.join(save_dir, f"{w}_predictions_{rank}.json")  # predictions json
         print('\nEvaluating pycocotools mAP... saving %s...' % pred_json)
@@ -314,12 +452,12 @@ def test(data_dict,
             # Merge multiple results files
             if rank == 0:
                 print("[INFO] Merge detection results...", flush=True)
-                pred_json, merged_results = fn_dict.merge_json(project_dir, prefix=w)
+                pred_json, merged_results = merge_json(project_dir, prefix=w)
         try:
             if rank == 0 and (opt.result_view or opt.recommend_threshold):
                 print("[INFO] Start visualization result.", flush=True)
-                fn_dict.view_result(anno_json, pred_json, data_dict["val"], score_threshold=None,
-                                    recommend_threshold=opt.recommend_threshold)
+                view_result(anno_json, pred_json, data["val"], score_threshold=None,
+                            recommend_threshold=opt.recommend_threshold)
                 print("[INFO] Visualization result completed.", flush=True)
         except Exception as e:
             print(f'[WARNING] Visualization eval result fail: {e}', flush=True)
@@ -327,9 +465,8 @@ def test(data_dict,
         try:  # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
             if rank == 0:
                 print("[INFO] Start evaluating mAP...", flush=True)
-                imgIds = [int(Path(x).stem) for x in dataset.img_files] if is_coco else None
-                map, map50, map_table_str = fn_dict.coco_eval(anno_json, merged_results if is_distributed else jdict,
-                                                              imgIds)
+                map, map50, map_table_str = coco_eval(anno_json, merged_results if is_distributed else jdict,
+                                                      dataset, is_coco)
                 print("[INFO] Finish evaluating mAP.", flush=True)
                 print(f"COCO mAP:\n{map_table_str}", flush=True)
                 if os.path.exists(sync_tmp_file):
@@ -356,69 +493,59 @@ def test(data_dict,
     return (mp, mr, map50, map, *(loss / per_epoch_size).tolist(), map_table_str), maps, t
 
 
-def context_init(opt):
-    ms_mode = context.GRAPH_MODE if opt.ms_mode == "graph" else context.PYNATIVE_MODE
-    context.set_context(mode=ms_mode, device_target=opt.device_target, save_graphs=False)
+if __name__ == '__main__':
+    parser = get_args_test()
+    opt = parser.parse_args()
+    opt.save_json |= opt.data.endswith('coco.yaml')
+    opt.data, opt.cfg, opt.hyp = check_file(opt.data), check_file(opt.cfg), check_file(opt.hyp)  # check files
+    print(opt)
+
+    ms_mode = ms.GRAPH_MODE if opt.ms_mode == "graph" else ms.PYNATIVE_MODE
+    ms.set_context(mode=ms.PYNATIVE_MODE, device_target=opt.device_target)
+    # ms.set_context(pynative_synchronize=True)
+    context.set_context(mode=ms_mode, device_target=opt.device_target)
     if opt.device_target == "Ascend":
         device_id = int(os.getenv('DEVICE_ID', 0))
         context.set_context(device_id=device_id)
-    # Distribute Train
     rank, rank_size, parallel_mode = 0, 1, ParallelMode.STAND_ALONE
+    # Distribute Test
     if opt.is_distributed:
         init()
         rank, rank_size, parallel_mode = get_rank(), get_group_size(), ParallelMode.DATA_PARALLEL
     context.set_auto_parallel_context(parallel_mode=parallel_mode, gradients_mean=True, device_num=rank_size)
-    return rank, rank_size
-
-
-def parse_config(local=False, config_fn=None):
-    parse = get_args_test()
-    opt, data_dict, hyp = None, None, None
-    if config_fn is not None and config_fn(parse) is not None:
-        opt, data_dict, hyp = config_fn(parse)
-    opt.save_json |= opt.data.endswith('coco.yaml')
-    rank = 0 if not opt.is_distributed else get_rank()
-    rank_size = 1 if not opt.is_distributed else get_group_size()
     opt.total_batch_size = opt.batch_size
     opt.rank_size = rank_size
     opt.rank = rank
     if rank_size > 1:
         assert opt.batch_size % opt.rank_size == 0, '--batch-size must be multiple of device count'
         opt.batch_size = opt.total_batch_size // opt.rank_size
-    return opt, data_dict, hyp
-
-
-def run_test(opt, data_dict, hyp, default_fn):
     if opt.task in ('train', 'val', 'test'):  # run normally
         print("opt:", opt)
-        info, _, _ = test(data_dict,
-                          hyp,
-                          opt.weights,
-                          opt.batch_size,
-                          opt.img_size,
-                          opt.conf_thres,
-                          opt.iou_thres,
-                          opt.save_json,
-                          opt.single_cls,
-                          opt.augment,
-                          opt.verbose,
-                          save_txt=opt.save_txt | opt.save_hybrid,
-                          save_hybrid=opt.save_hybrid,
-                          save_conf=opt.save_conf,
-                          trace=not opt.no_trace,
-                          rect=opt.rect,
-                          is_coco=opt.is_coco,
-                          plots=False,
-                          half_precision=False,
-                          v5_metric=opt.v5_metric,
-                          is_distributed=opt.is_distributed,
-                          rank=opt.rank,
-                          rank_size=opt.rank_size,
-                          opt=opt,
-                          fn_dict=default_fn)
+        test(opt.data,
+             opt.weights,
+             opt.batch_size,
+             opt.img_size,
+             opt.conf_thres,
+             opt.iou_thres,
+             opt.save_json,
+             opt.single_cls,
+             opt.augment,
+             opt.verbose,
+             save_txt=opt.save_txt | opt.save_hybrid,
+             save_hybrid=opt.save_hybrid,
+             save_conf=opt.save_conf,
+             trace=not opt.no_trace,
+             rect=opt.rect,
+             plots=False,
+             half_precision=False,
+             v5_metric=opt.v5_metric,
+             is_distributed=opt.is_distributed,
+             rank=opt.rank,
+             rank_size=opt.rank_size,
+             opt=opt)
 
     elif opt.task == 'speed':  # speed benchmarks
-        test(data_dict, hyp, opt.weights, opt.batch_size, opt.img_size, 0.25, 0.45,
+        test(opt.data, opt.weights, opt.batch_size, opt.img_size, 0.25, 0.45,
              save_json=False, plots=False, half_precision=False, v5_metric=opt.v5_metric)
 
     elif opt.task == 'study':  # run over a range of settings and save/plot
@@ -428,10 +555,9 @@ def run_test(opt, data_dict, hyp, default_fn):
         y = []  # y axis
         for i in x:  # img-size
             print(f'\nRunning {f} point {i}...')
-            r, _, t = test(data_dict, hyp, opt.weights, opt.batch_size, i, opt.conf_thres, opt.iou_thres, opt.save_json,
+            r, _, t = test(opt.data, opt.weights, opt.batch_size, i, opt.conf_thres, opt.iou_thres, opt.save_json,
                            plots=False, half_precision=False, v5_metric=opt.v5_metric)
             y.append(r + t)  # results and times
         np.savetxt(f, y, fmt='%10.4g')  # save
         os.system('zip -r study.zip study_*.txt')
         plot_study_txt(x=x)  # plot
-    return info

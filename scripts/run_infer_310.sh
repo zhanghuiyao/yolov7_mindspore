@@ -1,58 +1,34 @@
 #!/bin/bash
-# Copyright 2022 Huawei Technologies Co., Ltd
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ===========================================================================
-if [ $# != 5 ] && [ $# != 2 ]
-then
-    echo "Usage: bash run_infer_310.sh [MINDIR_PATH] [DEVICE_ID]"
-    echo "OR"
-    echo "Usage: bash run_infer_310.sh [CONFIG_PATH] [DATA_PATH] [HYP_PATH] [MINDIR_PATH] [DEVICE_ID]"
-exit 1
-fi
 
-get_real_path(){
-  if [ "${1:0:1}" == "/" ]; then
-    echo "$1"
-  else
-    echo "$(realpath -m $PWD/$1)"
-  fi
-}
+###==========================================================================
+### Usage: bash run_standalone_train_ascend.sh [OPTIONS]...
+### Description:
+###     Run distributed train for YOLOv5 model.
+###     Note that long option should use '--option=value' format, short option should use '-o value'
+### Options:
+###   -d  --data                path to dataset config yaml file
+###   -D, --device              device id for standalone train, or start device id for distribute train
+###   -H, --help                print this help message
+###   -h  --hyp                 path to hyper-parameter config yaml file
+###   -c, --config              path to model config file
+###   -w, --weights             ckpt to model
+###   -m, --weights             mindir to model
+### Example:
+### 1. train models with config. Configs in [] are optional.
+###     bash run_standalone_train_ascend.sh [-c config.yaml -d coco.yaml --hyp=hyp.config.yaml]
+###==========================================================================
 
-device_id=0
+source common.sh
+parse_args "$@"
+get_default_config
 
-if [ $# == 2 ]
-then
-  model=$(get_real_path $1)
-  device_id=$2
-  CONFIG_PATH=$"./config/network_yolov7/yolov7.yaml"
-  DATA_PATH=$"./config/data/coco.yaml"
-  HYP_PATH=$"./config/data/hyp.scratch.p5.yaml"
-fi
-
-if [ $# == 5 ]
-then
-  CONFIG_PATH=$(get_real_path $1)
-  DATA_PATH=$(get_real_path $2)
-  HYP_PATH=$(get_real_path $3)
-  model=$(get_real_path $4)
-  device_id=$5
-fi
-
-echo $model
-echo $CONFIG_PATH
-echo $DATA_PATH
-echo $HYP_PATH
+export DEVICE_ID=$DEVICE_ID
+model=$MINDIR
+echo "CONFIG PATH: $CONFIG_PATH"
+echo "DATA PATH: $DATA_PATH"
+echo "HYP PATH: $HYP_PATH"
+echo "DEVICE ID: $DEVICE_ID"
+echo "model: $MINDIR"
 
 function compile_app()
 {

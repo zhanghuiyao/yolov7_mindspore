@@ -100,7 +100,7 @@ other datasets need to use the same format as MS COCO.
   ```text
   #run training example(1p) by python command
   python train.py \
-      --cfg=./config/network_yolov7/yolov7.yaml \
+      --cfg=./config/network/yolov7.yaml \
       --data=./config/data/coco.yaml \
       --hyp=./config/data/hyp.scratch.p5.yaml \
       --recompute=True \
@@ -169,7 +169,7 @@ other datasets need to use the same format as MS COCO.
     ├─data
         ├─coco.yaml
         ├─hyp.scratch.p5.yaml
-    ├─network_yolov7
+    ├─network
         ├─yolov7.yaml
     ├─args.py
   ├─network
@@ -236,7 +236,7 @@ bash run_standalone_train.sh 0
 
 ```text
 python train.py \
-  --cfg=./config/network_yolov7/yolov7.yaml \
+  --cfg=./config/network/yolov7.yaml \
   --data=./config/data/coco.yaml \
   --hyp=./config/data/hyp.scratch.p5.yaml \
   --recompute=True \

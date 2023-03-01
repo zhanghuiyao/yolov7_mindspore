@@ -1,80 +1,55 @@
 #!/bin/bash
 
-if [ $# != 4 ] && [ $# != 1 ]
-then
-    echo "Usage: bash run_distribute_train.sh [CONFIG_PATH] [DATA_PATH] [HYP_PATH] [DEVICE_ID]"
-    echo "OR"
-    echo "Usage: bash run_distribute_train.sh [DEVICE_ID]"
-exit 1
-fi
+###==========================================================================
+### Usage: bash run_standalone_train_ascend.sh [OPTIONS]...
+### Description:
+###     Run distributed train for YOLOv5 model.
+###     Note that long option should use '--option=value' format, short option should use '-o value'
+### Options:
+###   -d  --data                path to dataset config yaml file
+###   -D, --device              device id for standalone train, or start device id for distribute train
+###   -H, --help                print this help message
+###   -h  --hyp                 path to hyper-parameter config yaml file
+###   -c, --config              path to model config file
+###   -w, --weights             ckpt to model
+###   -m, --weights             mindir to model
+### Example:
+### 1. train models with config. Configs in [] are optional.
+###     bash run_standalone_train_ascend.sh [-c config.yaml -d coco.yaml --hyp=hyp.config.yaml]
+###==========================================================================
 
-get_real_path(){
-  if [ "${1:0:1}" == "/" ]; then
-    echo "$1"
-  else
-    echo "$(realpath -m $PWD/$1)"
-  fi
-}
+source common.sh
+parse_args "$@"
+get_default_config
 
-if [ $# == 1 ]
-then
-  DEVICE_ID=$1
-  CONFIG_PATH=$"./config/network_yolov7/yolov7.yaml"
-  DATA_PATH=$"./config/data/coco.yaml"
-  HYP_PATH=$"./config/data/hyp.scratch.p5.yaml"
-fi
-
-if [ $# == 4 ]
-then
-  DEVICE_ID=$4
-  CONFIG_PATH=$(get_real_path $1)
-  DATA_PATH=$(get_real_path $2)
-  HYP_PATH=$(get_real_path $3)
-fi
-
-echo $CONFIG_PATH
-echo $DATA_PATH
-echo $HYP_PATH
-
-
-export DEVICE_NUM=1
-export RANK_SIZE=1
 export DEVICE_ID=$DEVICE_ID
-export RANK_ID=$DEVICE_ID
+echo "CONFIG PATH: $CONFIG_PATH"
+echo "DATA PATH: $DATA_PATH"
+echo "HYP PATH: $HYP_PATH"
+echo "DEVICE ID: $DEVICE_ID"
 
-cpus=`cat /proc/cpuinfo| grep "processor"| wc -l`
-avg=`expr $cpus \/ $RANK_SIZE`
-gap=`expr $avg \- 1`
+cur_dir=$(pwd)
+build_third_party_files "$cur_dir" "../third_party"
 
-rm -rf ./train_standalone$DEVICE_ID
-mkdir ./train_standalone$DEVICE_ID
-cp ../*.py ./train_standalone$DEVICE_ID
-cp -r ../config ./train_standalone$DEVICE_ID
-cp -r ../network ./train_standalone$DEVICE_ID
-cp -r ../utils ./train_standalone$DEVICE_ID
-mkdir ./train_standalone$DEVICE_ID/scripts
-cp -r ../scripts/*.sh ./train_standalone$DEVICE_ID/scripts/
-cd ./train_standalone$DEVICE_ID || exit
-echo "start training for rank $RANK_ID, device $DEVICE_ID"
+export RANK_ID=0
+train_exp=$(get_work_dir "train_exp_standalone")
+train_exp=$(realpath "${train_exp}")
+echo "Make directory ${train_exp}"
+copy_files_to "$train_exp"
+cd "${train_exp}" || exit
 env > env.log
+
 python train.py \
-    --ms_strategy="StaticShape" \
-    --ms_amp_level="O0" \
-    --ms_loss_scaler="static" \
-    --ms_loss_scaler_value=1024 \
-    --ms_optim_loss_scale=1 \
-    --ms_grad_sens=1024 \
-    --overflow_still_update=True \
-    --clip_grad=False \
-    --sync_bn=False \
-    --optimizer="momentum" \
-    --cfg=$CONFIG_PATH \
-    --data=$DATA_PATH \
-    --hyp=$HYP_PATH \
-    --device_target=Ascend \
-    --is_distributed=False \
-    --epochs=300 \
-    --recompute=True \
-    --recompute_layers=5 \
-    --batch_size=16  > log.txt 2>&1 &
+        --clip_grad=False \
+        --optimizer="momentum" \
+        --cfg=$CONFIG_PATH \
+        --data=$DATA_PATH \
+        --hyp=$HYP_PATH \
+        --device_target=Ascend \
+        --profiler=False \
+        --accumulate=False \
+        --epochs=300 \
+        --iou_thres=0.65 \
+        --batch_size=16  > log.txt 2>&1 &
 cd ..
+

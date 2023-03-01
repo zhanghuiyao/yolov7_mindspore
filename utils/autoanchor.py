@@ -2,6 +2,7 @@
 
 from mindspore import ops
 
+
 def check_anchor_order(m):
     # Check anchor order against stride order for YOLO Detect() module m, and correct if necessary
     a = ops.ReduceProd()(m.anchor_grid, -1).view(-1) # anchor area

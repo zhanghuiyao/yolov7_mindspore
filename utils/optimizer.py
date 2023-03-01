@@ -17,7 +17,8 @@ def one_cycle(y1=0.0, y2=1.0, steps=100):
     # lambda function for sinusoidal ramp from y1 to y2
     return lambda x: ((1 - math.cos(x * math.pi / steps)) / 2) * (y2 - y1) + y1
 
-def get_group_param_yolov7(model):
+
+def get_group_param(model):
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
     for k, v in model.cells_and_names():
         if hasattr(v, 'bias') and isinstance(v.bias, ms.Parameter):
@@ -86,7 +87,8 @@ def get_group_param_yolov7(model):
                 pg0.append(v.rbr_dense.vector)
     return pg0, pg1, pg2
 
-def get_lr_yolov7(opt, hyp, per_epoch_size):
+
+def get_lr(opt, hyp, per_epoch_size):
     # Scheduler https://arxiv.org/pdf/1812.01187.pdf
     # https://pytorch.org/docs/stable/_modules/torch/optim/lr_scheduler.html#OneCycleLR
     init_lr, warmup_bias_lr, warmup_epoch, lrf = \
@@ -98,7 +100,7 @@ def get_lr_yolov7(opt, hyp, per_epoch_size):
         with_momentum = True
     elif opt.optimizer == "adam":
         with_momentum = False
-    elif opt.optimizer == "thor": # not use this lr
+    elif opt.optimizer == "thor":  # not use this lr
         with_momentum = False
     else:
         raise NotImplementedError
@@ -154,6 +156,7 @@ def get_thor_lr(global_step, lr_init, decay, total_epochs, steps_per_epoch, deca
     lr_each_step = np.array(lr_each_step).astype(np.float32)
     learning_rate = lr_each_step[current_step:]
     return learning_rate
+
 
 def get_thor_damping(global_step, damping_init, decay_rate, total_epochs, steps_per_epoch):
     """get_model_damping"""
