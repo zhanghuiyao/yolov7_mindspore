@@ -21,7 +21,7 @@ get_real_path(){
 
 if [ $# == 2 ]
 then
-  CONFIG_PATH=$"./config/network_yolov7/yolov7.yaml"
+  CONFIG_PATH=$"./config/network/yolov7.yaml"
   DATA_PATH=$"./config/data/coco.yaml"
   HYP_PATH=$"./config/data/hyp.scratch.p5.yaml"
 fi

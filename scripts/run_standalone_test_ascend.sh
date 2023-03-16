@@ -1,55 +1,53 @@
 #!/bin/bash
 
-if [ $# != 2 ] && [ $# != 5 ]
-then
-    echo "Usage: bash run_standalone_test_ascend.sh [WEIGHTS] [DEVICE_ID]"
-    echo "OR"
-    echo "Usage: bash run_standalone_test_ascend.sh [WEIGHTS] [DEVICE_ID] [CONFIG_PATH] [DATA_PATH] [HYP_PATH]"
-exit 1
+###==========================================================================
+### Usage: bash run_standalone_test_ascend.sh [OPTIONS]...
+### Description:
+###     Run distributed test for YOLOv5 model.
+###     Note that long option should use '--option=value' format, short option should use '-o value'
+### Options:
+###   -d  --data                path to dataset config yaml file
+###   -D, --device              device id for standalone train, or start device id for distribute train
+###   -H, --help                print this help message
+###   -h  --hyp                 path to hyper-parameter config yaml file
+###   -c, --config              path to model config file
+###   -w, --weights              path to checkpoint weights
+###   -w, --weights             ckpt to model
+###   -m, --weights             mindir to model
+### Example:
+### 1. Test checkpoint with config. Configs in [] are optional.
+###     bash run_standalone_test_ascend.sh -w weights.ckpt [-c config.yaml -d coco.yaml --hyp=hyp.config.yaml]
+###==========================================================================
+
+
+source common.sh
+parse_args "$@"
+get_default_config
+
+export DEVICE_ID=$DEVICE_ID
+export RANK_ID=0
+
+echo "WEIGHTS: $WEIGHTS"
+echo "CONFIG PATH: $CONFIG_PATH"
+echo "DATA PATH: $DATA_PATH"
+echo "HYP PATH: $HYP_PATH"
+echo "DEVICE ID: $DEVICE_ID"
+
+if [ -z "$WEIGHTS" ]; then
+    echo "ERROR: Weights argument path is empty, which is required."
+    exit 1
 fi
 
-WEIGHTS=$1
-export DEVICE_ID=$2
-export RANK_ID=$2
-
-get_real_path(){
-  if [ "${1:0:1}" == "/" ]; then
-    echo "$1"
-  else
-    echo "$(realpath -m $PWD/$1)"
-  fi
-}
-
-if [ $# == 2 ]
-then
-  CONFIG_PATH=$"./config/network_yolov7/yolov7.yaml"
-  DATA_PATH=$"./config/data/coco.yaml"
-  HYP_PATH=$"./config/data/hyp.scratch.p5.yaml"
-fi
-
-if [ $# == 5 ]
-then
-  CONFIG_PATH=$(get_real_path $3)
-  DATA_PATH=$(get_real_path $4)
-  HYP_PATH=$(get_real_path $5)
-fi
-
-echo $CONFIG_PATH
-echo $DATA_PATH
-echo $HYP_PATH
-
+cur_dir=$(pwd)
+build_third_party_files "$cur_dir" "../third_party"
 
 export DEVICE_NUM=1
 export RANK_SIZE=1
-rm -rf ./test_standalone$2
-mkdir ./test_standalone$2
-cp ../*.py ./test_standalone$2
-cp -r ../config ./test_standalone$2
-cp -r ../network ./test_standalone$2
-cp -r ../utils ./test_standalone$2
-mkdir ./test_standalone$2/scripts
-cp -r ../scripts/*.sh ./test_standalone$2/scripts/
-cd ./test_standalone$2 || exit
+eval_exp=$(get_work_dir "eval_exp_standalone")
+eval_exp=$(realpath "${eval_exp}")
+echo "Make directory ${eval_exp}"
+copy_files_to "$eval_exp"
+cd "${eval_exp}" || exit
 env > env.log
 python test.py \
   --weights=$WEIGHTS \
@@ -59,6 +57,7 @@ python test.py \
   --device_target=Ascend \
   --img_size=640 \
   --conf=0.001 \
-  --iou=0.65 \
-  --batch_size=32 > log.txt 2>&1 &
+  --rect=False \
+  --iou_thres=0.65 \
+  --batch_size=16 > log.txt 2>&1 &
 cd ..

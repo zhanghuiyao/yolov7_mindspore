@@ -300,6 +300,7 @@ class ComputeLoss(nn.Cell):
 
         # Losses
         for layer_index, pi in enumerate(p):  # layer index, layer predictions
+            pi = ops.cast(pi, ms.float32)
             tmask = tmasks[layer_index]
             b, a, gj, gi = ops.split(indices[layer_index] * tmask[None, :], 0, 4)  # image, anchor, gridy, gridx
             b, a, gj, gi = b.view(-1), a.view(-1), gj.view(-1), gi.view(-1)
@@ -470,6 +471,7 @@ class ComputeLossOTA_dynamic(nn.Cell):
 
         # Losses
         for i, pi in enumerate(p):  # layer index, layer predictions
+            pi = ops.cast(pi, ms.float32)
             b, a, gj, gi = bs[i], as_[i], gjs[i], gis[i]  # image, anchor, gridy, gridx, tmask
             tobj = ops.zeros_like(pi[..., 0])  # target obj
 
@@ -552,6 +554,7 @@ class ComputeLossOTA_dynamic(nn.Cell):
             all_anch = ()
 
             for i, pi in enumerate(p):
+                pi = ops.cast(pi, ms.float32)
                 b, a, gj, gi = ops.split(indices[i], 0, 4)
                 b, a, gj, gi = b.view(-1), a.view(-1), gj.view(-1), gi.view(-1)
 
@@ -827,6 +830,7 @@ class ComputeLossOTA(nn.Cell):
 
         # Losses
         for i, pi in enumerate(p):  # layer index, layer predictions
+            pi = ops.cast(pi, ms.float32)
             b, a, gj, gi, tmask = bs[i], as_[i], gjs[i], gis[i], tmasks[i]  # image, anchor, gridy, gridx, tmask
             tobj = ops.zeros_like(pi[..., 0])  # target obj
 
@@ -895,6 +899,7 @@ class ComputeLossOTA(nn.Cell):
         all_tmasks = ()
 
         for i, pi in enumerate(p):
+            pi = ops.cast(pi, ms.float32)
             _this_indices = indices[i].view(4, 3 * na, batch_size, n_gt_max).transpose(0, 2, 1, 3).view(4, -1)
             _this_anch = anch[i].view(3 * na, batch_size, n_gt_max * 2).transpose(1, 0, 2).view(-1, 2)
             _this_mask = tmasks[i].view(3 * na, batch_size, n_gt_max).transpose(1, 0, 2).view(-1)
